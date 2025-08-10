@@ -1,0 +1,1588 @@
+import React, { useState, useRef, useEffect } from "react";
+
+/** ========= Constants / Keys ========= **/
+const BRAND_RED = "#E60012";
+const MANUAL_OPTION = "__MANUAL__";
+const LS = {
+  company: "companyInfoV1",
+  customer: "customerInfoV1",
+  items: "itemsV1",
+  signCustomer: "signCustomerV1",
+  signStaff: "signStaffV1",
+  payment: "paymentMethodV1",
+  storeCode: "storeCodeV1",
+  lead: "leadInfoV1",
+  logs: "dealLogsV1",
+  staff: "staffV1",
+  prices: "pricesV1",
+  brands: "brandMasterV1",
+  categories: "categoryMasterV1",
+  itemsMaster: "itemMasterV1",
+  missed: "missedItemsV1",
+  settings: "settingsV1",
+};
+
+/** ========= Helpers ========= **/
+const loadJSON = (k, def) => { try { const s = localStorage.getItem(k); return s ? { ...def, ...(JSON.parse(s)||{}) } : { ...def }; } catch { return { ...def }; } };
+const saveJSON  = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v||{})); } catch {} };
+const loadArray = (k) => { try { const a = JSON.parse(localStorage.getItem(k)||"[]"); return Array.isArray(a) ? a : []; } catch { return []; } };
+const saveArray = (k, a) => { try { localStorage.setItem(k, JSON.stringify(a||[])); } catch {} };
+// Debounced localStorage writer (batches within 150ms)
+let __saveQueue = {};
+let __saveTimer = null;
+function saveLater(k, v, isArray=false, delay=150){
+  try{
+    __saveQueue[k] = JSON.stringify(isArray ? (v||[]) : (v||{}));
+    if(__saveTimer) clearTimeout(__saveTimer);
+    __saveTimer = setTimeout(()=>{
+      Object.keys(__saveQueue).forEach(key=>{ try{ localStorage.setItem(key, __saveQueue[key]); } catch {} });
+      __saveQueue = {};
+      __saveTimer = null;
+    }, delay);
+  }catch{}
+}
+
+const floor100  = (v) => Math.floor((Number(v)||0)/100)*100; // 100円未満切捨
+
+// ===== Logs & Summary Helpers =====
+const loadLogs = () => { try { const a = JSON.parse(localStorage.getItem(LS.logs)||"[]"); return Array.isArray(a) ? a : []; } catch { return []; } };
+const saveLogs = (arr) => { try { localStorage.setItem(LS.logs, JSON.stringify(arr||[])); } catch {} };
+const appendDealLog = (entry) => { const logs = loadLogs(); logs.push(entry); saveLogs(logs); };
+
+// ===== Missed Deals (買いこぼし) Helpers =====
+const loadMissed = () => { try { const a = JSON.parse(localStorage.getItem(LS.missed)||"[]"); return Array.isArray(a) ? a : []; } catch { return []; } };
+const saveMissed = (arr) => { try { localStorage.setItem(LS.missed, JSON.stringify(arr||[])); } catch {} };
+const appendMissed = (entry) => { const a = loadMissed(); a.push(entry); saveMissed(a); };
+
+// ===== Signatures (base64 in localStorage) =====
+const getSig = (k) => { try { return localStorage.getItem(k) || ""; } catch { return ""; } };
+const setSig = (k, data) => { try { localStorage.setItem(k, data || ""); } catch {} };
+
+// 連番付きの契約番号: 例 KI-20250810-001
+function nextContractNo(storeCode){
+  try{
+    const k = `${storeCode}-seq`;
+    const now = new Date();
+    const y = now.getFullYear(); const m = String(now.getMonth()+1).padStart(2,'0'); const d = String(now.getDate()).padStart(2,'0');
+    const today = `${y}${m}${d}`;
+    const raw = JSON.parse(localStorage.getItem(k)||"{}");
+    const curDay = raw.day === today ? today : today;
+    const seq = raw.day === today ? (Number(raw.seq||0)+1) : 1;
+    localStorage.setItem(k, JSON.stringify({day:curDay, seq}));
+    return `${storeCode}-${today}-${String(seq).padStart(3,'0')}`;
+  }catch{ return `${storeCode}-${Date.now()}`; }
+}
+
+// ===== Settings & Retention =====
+const loadSettings = () => { try { const j = JSON.parse(localStorage.getItem(LS.settings)||"null"); return j && typeof j==='object' ? j : { retentionDays:60, newSheetOnLaunch:false }; } catch { return { retentionDays:60, newSheetOnLaunch:false }; } };
+const saveSettings = (obj) => { try { localStorage.setItem(LS.settings, JSON.stringify(obj||{})); } catch {} };
+const pruneLogs = (keepDays=60) => { const logs = loadLogs(); const cutoff = Date.now() - (Number(keepDays)||60)*24*60*60*1000; const pruned = logs.filter(l=>{ const t = Date.parse(l.date||l.time||''); return isFinite(t) ? t >= cutoff : true; }); saveLogs(pruned); };
+
+/** ========= Toast (Feedback) ========= **/
+function showToast(msg, type='info'){ try{ window.dispatchEvent(new CustomEvent('SHOW_TOAST', { detail:{ msg, type } })); }catch{} }
+function ToastHost(){
+  const [toasts, setToasts] = React.useState([]);
+  React.useEffect(()=>{
+    const h = (e)=>{ const d=e.detail||{}; const id=Date.now()+Math.random(); setToasts(t=>[...t,{id, msg:String(d.msg||''), type:d.type||'info'}]); setTimeout(()=> setToasts(t=> t.filter(x=> x.id!==id)), 2600); };
+    window.addEventListener('SHOW_TOAST', h);
+    return ()=> window.removeEventListener('SHOW_TOAST', h);
+  },[]);
+  const bg = (t)=> t.type==='error' ? '#ef4444' : (t.type==='warn' ? '#f59e0b' : '#111');
+  return (<div style={{position:'fixed', right:12, top:12, display:'grid', gap:8, zIndex:99999}}>
+    {toasts.map(t=> <div key={t.id} style={{background:bg(t), color:'#fff', padding:'10px 12px', borderRadius:8, boxShadow:'0 4px 16px rgba(0,0,0,.18)'}}>{t.msg}</div>)}
+  </div>);
+}
+/** ========= Global Styles (UI polish) ========= **/
+function GlobalStyles(){
+  return (<style>{`
+    table thead th{ position: sticky; top: 0; background: #f9fafb; z-index: 1; }
+    table tbody tr:nth-child(odd){ background: #fcfcfc; }
+    table tbody tr:hover{ background: #f3f4f6; }
+    button{ border-radius: 8px; cursor: pointer; }
+    button:focus{ outline: 2px solid rgba(230,0,18,.2); outline-offset: 2px; }
+  `}</style>);
+}
+
+function openDailySummaryTab(){
+  const logs = loadLogs();
+  const d = new Date();
+  const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,'0'), da = String(d.getDate()).padStart(2,'0');
+  const dayKey = `${y}-${m}-${da}`;
+  const todays = logs.filter(l => (l.date||'').startsWith(dayKey));
+  let sumSale=0, sumPay=0, sumProfit=0, sumLines=0;
+  const rowsHtml = todays.map(l => {
+    sumSale += l.saleTotal||0; sumPay += l.payoutTotal||0; sumProfit += l.profitTotal||0; sumLines += l.lines||0;
+    const when = (l.time||'').slice(11,19);
+    const lead=(l.leadShort||''); const age=(l.age||''); const gender=(l.gender||''); const staff=(l.staff||'');
+    return `<tr><td>${when}</td><td>${l.contractNo||''}</td><td style="text-align:right">¥${(l.saleTotal||0).toLocaleString()}</td><td style="text-align:right">¥${(l.payoutTotal||0).toLocaleString()}</td><td style="text-align:right">¥${(l.profitTotal||0).toLocaleString()}</td><td>${lead}</td><td>${age}</td><td>${gender}</td><td>${staff}</td><td style="text-align:right">${l.lines||0}</td></tr>`;
+  }).join('');
+  const header = ['時刻','契約番号','上代合計','下代合計','粗利合計','流入','年齢','性別','担当者','明細数'];
+  const esc = (s) => { const t = String(s==null ? '' : s); const needs = t.includes('"') || t.includes(',') || t.includes('\n'); const t2 = t.replace(/\"/g,'""'); return needs ? '"'+t2+'"' : t2; };
+  const rowsCsv = (todays||[]).map(l => [ (l.time||'').slice(11,19), l.contractNo||'', l.saleTotal||0, l.payoutTotal||0, l.profitTotal||0, l.leadShort||'', l.age||'', l.gender||'', l.staff||'', l.lines||0 ]);
+  const csv = [header.map(esc).join(',')].concat(rowsCsv.map(r => r.map(esc).join(','))).join('\r\n');
+  const csvHref = 'data:text/csv;charset=utf-8,%EF%BB%BF' + encodeURIComponent(csv);
+  const html = '<!doctype html><html><head><meta charset="utf-8"><title>日次集計 ' + dayKey + '</title>' +
+  '<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Hiragino Kaku Gothic ProN",Meiryo,sans-serif;margin:0;padding:16px;color:#111}' +
+  'h2{margin:0 0 8px;color:' + BRAND_RED + '}' +
+  'table{border-collapse:collapse;width:100%;margin-top:10px} th,td{border:1px solid #ddd;padding:6px;font-size:13px} th{background:#f9fafb;text-align:left}' +
+  '.tot{margin-top:10px;text-align:right} .btns{display:flex;gap:8px;margin-top:12px} @media print{.btns{display:none}}' +
+  '</style></head><body>' +
+  '<h2>日次集計 ' + dayKey + '</h2>' +
+  '<table><thead><tr><th>時刻</th><th>契約番号</th><th style="text-align:right">上代合計</th><th style="text-align:right">下代合計</th><th style="text-align:right">粗利合計</th><th>流入</th><th>年齢</th><th>性別</th><th>担当者</th><th style="text-align:right">明細数</th></tr></thead><tbody>' + (rowsHtml||'') + '</tbody></table>' +
+  '<div class="tot">上代合計 ¥' + sumSale.toLocaleString() + ' ／ 下代合計 ¥' + sumPay.toLocaleString() + ' ／ 粗利合計 ¥' + sumProfit.toLocaleString() + ' ／ 明細合計 ' + sumLines + '</div>' +
+  '<div class="btns">' +
+    '<button onclick="window.print()" style="padding:8px 12px;border:1px solid ' + BRAND_RED + ';background:#fff;color:' + BRAND_RED + ';border-radius:8px;cursor:pointer">印刷（PDF保存）</button>' +
+    '<a href="' + csvHref + '" download="daily_' + dayKey + '.csv" style="padding:9px 12px;border:1px solid #111;background:#fff;color:#111;border-radius:8px;text-decoration:none;display:inline-block">CSVダウンロード</a>' +
+  '</div>' +
+  '</body></html>';
+  const w = window.open('', '_blank'); if(!w){ showToast('ポップアップを許可してください','warn'); return; }
+  w.document.write(html);
+  w.document.close();
+}
+
+/** ========= Defaults ========= **/
+const DEFAULT_COMPANY = {
+  company: "株式会社ReSHARK",
+  store: "買取一期 東神奈川駅前店",
+  tel1: "0120-545-651",
+  tel2: "045-624-8710",
+  permit: "神奈川県公安委員会 第452550007294",
+  note: "在庫限り／支払方法：現金・振込（○）",
+};
+const DEFAULT_CUSTOMER = { name: "", postalCode: "", address: "", phone: "", birthDate: "", age: "", gender: "", occupation: "", idType: "運転免許証", idNumber: "", idExpiry: "" };
+const DEFAULT_CATEGORIES = ["貴金属","ダイヤ・石","時計","バッグ","商品券","テレカ","切手","はがき"];
+
+// 相場（手動入力）用の初期値
+const DEFAULT_PRICES = {
+  K24: 0, K22: 0, K20: 0, K18: 0, K14: 0, K12: 0, K10: 0, K9: 0,
+  Pt1000: 0, Pt950: 0, Pt900: 0, Pt850: 0,
+  SV1000: 0, SV925: 0,
+  K18_Pt900: 0, K18_Pt850: 0, Pt900_K18: 0, Pt850_K18: 0,
+};
+
+// ブランド初期リスト（設定で増減・並替可）
+const DEFAULT_BRANDS = ["CHANEL","LOUIS VUITTON","GUCCI","HERMES","PRADA","COACH","その他"];
+
+// 画面用のカテゴリ別プルダウン定義
+const METAL_ITEMS = [
+  {k:'K24', label:'K24'}, {k:'K22', label:'K22'}, {k:'K20', label:'K20'}, {k:'K18', label:'K18'},
+  {k:'K14', label:'K14'}, {k:'K12', label:'K12'}, {k:'K10', label:'K10'}, {k:'K9', label:'K9'},
+  {k:'Pt1000', label:'Pt1000'}, {k:'Pt950', label:'Pt950'}, {k:'Pt900', label:'Pt900'}, {k:'Pt850', label:'Pt850'},
+  {k:'SV1000', label:'SV1000'}, {k:'SV925', label:'SV925'},
+  {k:'K18_Pt900', label:'K18/Pt900'}, {k:'K18_Pt850', label:'K18/Pt850'}, {k:'Pt900_K18', label:'Pt900/K18'}, {k:'Pt850_K18', label:'Pt850/K18'}
+];
+const CATEGORY_ITEMS = {
+  '貴金属': METAL_ITEMS.map(m=>m.label),
+  'ブランド': ['CHANEL','LOUIS VUITTON','GUCCI','HERMES','PRADA','その他'],
+  '時計': ['ROLEX','OMEGA','TAG HEUER','SEIKO','CITIZEN','その他'],
+  'バッグ': ['CHANEL','LOUIS VUITTON','GUCCI','HERMES','PRADA','COACH','その他'],
+  '商品券': ['百貨店','量販','地方','特殊','その他'],
+  'テレカ': ['50度','105度'],
+  '切手': ['シート','バラ'],
+  'はがき': ['官製','年賀']
+};
+const DEFAULT_ITEM_MASTER = CATEGORY_ITEMS;
+
+const DETAIL_MAP = {
+  '貴金属': ['ネックレス','リング','ブレス','ピアス','イヤリング','その他'],
+  'ブランド': ['財布','バッグ','小物','アクセ','その他'],
+  '時計': ['本体のみ','フルセット','ベルトのみ','その他'],
+  'バッグ': ['ハンド','ショルダー','トート','リュック','その他'],
+  '商品券': ['額面入力','混在','その他'],
+  'テレカ': ['未使用','台紙なし','その他'],
+  '切手': ['面額混在','記念','普通','その他'],
+  'はがき': ['未使用','書き損じ','その他']
+};
+
+/** ========= Generic Field (IME-safe ref) ========= **/
+const FieldInput = ({refEl, def, type="text", placeholder}) => (
+  <input ref={refEl} defaultValue={def||""} type={type} placeholder={placeholder||""} style={{padding:8}} autoComplete="off" />
+);
+
+/** ========= Company Info ========= **/
+function CompanyInfo(){
+  const init = loadJSON(LS.company, DEFAULT_COMPANY);
+  const [saved, setSaved] = useState(false);
+  const rCompany = useRef(); const rStore = useRef(); const rTel1 = useRef(); const rTel2 = useRef();
+  const rPermit = useRef(); const rNote = useRef();
+  const onSave = () => {
+    const v = {
+      company: rCompany.current?.value || "",
+      store:   rStore.current?.value   || "",
+      tel1:    rTel1.current?.value    || "",
+      tel2:    rTel2.current?.value    || "",
+      permit:  rPermit.current?.value  || "",
+      note:    rNote.current?.value    || "",
+    };
+    saveJSON(LS.company, v);
+    setSaved(true); setTimeout(()=>setSaved(false), 900);
+  };
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{fontWeight:700, color:BRAND_RED}}>会社情報（契約書ヘッダ）</div>
+      <div style={{display:'grid', gap:8, gridTemplateColumns:'repeat(auto-fit, minmax(240px, 1fr))'}}>
+        <label style={{display:'grid', gap:4}}><span style={{fontSize:12,color:'#555'}}>会社名</span><FieldInput refEl={rCompany} def={init.company} /></label>
+        <label style={{display:'grid', gap:4}}><span style={{fontSize:12,color:'#555'}}>店舗名</span><FieldInput refEl={rStore} def={init.store} /></label>
+        <label style={{display:'grid', gap:4}}><span style={{fontSize:12,color:'#555'}}>電話1</span><FieldInput refEl={rTel1} def={init.tel1} /></label>
+        <label style={{display:'grid', gap:4}}><span style={{fontSize:12,color:'#555'}}>電話2</span><FieldInput refEl={rTel2} def={init.tel2} /></label>
+        <label style={{display:'grid', gap:4}}><span style={{fontSize:12,color:'#555'}}>古物商許可番号</span><FieldInput refEl={rPermit} def={init.permit} /></label>
+        <label style={{display:'grid', gap:4}}><span style={{fontSize:12,color:'#555'}}>備考（固定文言）</span><FieldInput refEl={rNote} def={init.note} /></label>
+      </div>
+      <div style={{display:'flex', gap:8}}>
+        <button onClick={onSave} style={{background:BRAND_RED,color:'#fff',padding:'8px 12px',border:'none',borderRadius:8}}>保存</button>
+        {saved && <span style={{color:'#16a34a'}}>保存しました</span>}
+      </div>
+    </section>
+  );
+}
+
+/** ========= Customer Info ========= **/
+function CustomerInfo(){
+  const init = loadJSON(LS.customer, DEFAULT_CUSTOMER);
+  const [saved, setSaved] = useState(false);
+  const rName = useRef(); const rPhone = useRef(); const rZip = useRef(); const rAddr = useRef();
+  const rBirth = useRef(); const rAge = useRef(); const rGender = useRef(); const rOcc = useRef(); const rOccOther = useRef();
+  const rIdType = useRef(); const rIdNum = useRef(); const rExpiry = useRef();
+  const OCCUPATIONS = ["会社員","公務員","自営業","パート・アルバイト","学生","主婦(主夫)","無職","退職","その他"];
+  const AGE_OPTIONS = Array.from({length:83}, (_,i)=> String(i+18)); // 18〜100
+  const [occSel, setOccSel] = useState(OCCUPATIONS.includes(init.occupation||"") ? init.occupation : (init.occupation ? "その他" : ""));
+  const [zipMsg, setZipMsg] = useState("");
+  const calcAge = (iso) => { if (!iso) return ""; const d = new Date(iso); if (isNaN(d)) return ""; const t = new Date(); let a = t.getFullYear() - d.getFullYear(); const m = t.getMonth() - d.getMonth(); if (m < 0 || (m === 0 && t.getDate() < d.getDate())) a--; return String(Math.max(0, a)); };
+  const onBirthChange = (e) => {
+    const v = e.target.value || '';
+    if (rAge.current) {
+      const a = calcAge(v);
+      if (a) rAge.current.value = a;
+    }
+  };
+  const sanitizeZip = (s) => (s||'').replace(/[^0-9]/g,'');
+  const searchZip = async () => {
+    const raw = rZip.current?.value || '';
+    const zip = sanitizeZip(raw);
+    if (zip.length !== 7) { setZipMsg('7桁の郵便番号を入力'); return; }
+    try {
+      setZipMsg('検索中...');
+      const res = await fetch('https://zipcloud.ibsnet.co.jp/api/search?zipcode=' + zip);
+      const data = await res.json();
+      if (data && data.results && data.results[0]) {
+        const r = data.results[0];
+        const addr = (r.address1||'') + (r.address2||'') + (r.address3||'');
+        if (rAddr.current) rAddr.current.value = addr;
+        setZipMsg('住所を反映しました');
+      } else {
+        setZipMsg('見つかりませんでした');
+      }
+    } catch(e) { setZipMsg('検索エラー'); }
+  };
+  const onSave = () => {
+    const bd = rBirth.current?.value || "";
+    let ageVal = rAge.current?.value || "";
+    if (bd) { const a = calcAge(bd); if (a) ageVal = a; }
+    const v = {
+      name: rName.current?.value || "",
+      phone: rPhone.current?.value || "",
+      postalCode: rZip.current?.value || "",
+      address: rAddr.current?.value || "",
+      
+      birthDate: bd,
+      age: ageVal,
+      gender: rGender.current?.value || "",
+      occupation: ((rOcc.current?.value === "その他") ? (rOccOther.current?.value || "その他") : (rOcc.current?.value || "")),
+      idType: rIdType.current?.value || "運転免許証",
+      idNumber: rIdNum.current?.value || "",
+      idExpiry: rExpiry.current?.value || "",
+    };
+    saveJSON(LS.customer, v); setSaved(true); setTimeout(()=>setSaved(false), 900);
+  };
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{fontWeight:700, color:BRAND_RED}}>お客様情報（契約書に印字）</div>
+      <div style={{display:'grid', gap:8, gridTemplateColumns:'repeat(auto-fit, minmax(240px, 1fr))'}}>
+        <label style={{display:'grid', gap:4}}><span style={{fontSize:12,color:'#555'}}>氏名</span><FieldInput refEl={rName} def={init.name} /></label>
+        <label style={{display:'grid', gap:4}}><span style={{fontSize:12,color:'#555'}}>電話</span><FieldInput refEl={rPhone} def={init.phone} /></label>
+        <label style={{display:'grid', gap:4}}>
+          <span style={{fontSize:12,color:'#555'}}>郵便番号</span>
+          <div style={{display:'flex', gap:8}}>
+            <input ref={rZip} defaultValue={init.postalCode||""} placeholder="例：221-0821" style={{padding:8, width:140}} onBlur={()=>{ if(!rAddr.current?.value) searchZip(); }} />
+            <button type="button" onClick={searchZip} style={{padding:'8px 12px', border:'1px solid #ddd', background:'#fff', borderRadius:6}}>住所検索</button>
+          </div>
+          <span style={{fontSize:12, color:'#666'}}>{zipMsg||'ハイフンあり/なし可（7桁）'}</span>
+        </label>
+        <label style={{display:'grid', gap:4}}><span style={{fontSize:12,color:'#555'}}>住所</span><FieldInput refEl={rAddr} def={init.address} /></label>
+        <label style={{display:'grid', gap:4}}>
+          <span style={{fontSize:12,color:'#555'}}>生年月日</span>
+          <input ref={rBirth} defaultValue={init.birthDate||""} type="date" onChange={onBirthChange} style={{padding:8}} />
+        </label>
+        <label style={{display:'grid', gap:4}}>
+          <span style={{fontSize:12,color:'#555'}}>年齢</span>
+          <select ref={rAge} defaultValue={init.age||""} style={{padding:8}}>
+            <option value="">— 選択 —</option>
+            {AGE_OPTIONS.map(a=> <option key={a} value={a}>{a}</option>)}
+          </select>
+        </label>
+        <label style={{display:'grid', gap:4}}>
+          <span style={{fontSize:12,color:'#555'}}>性別</span>
+          <select ref={rGender} defaultValue={init.gender||""} style={{padding:8}}>
+            {['男性','女性','その他','未回答'].map(v=> <option key={v} value={v}>{v}</option>)}
+          </select>
+        </label>
+        <label style={{display:'grid', gap:4, gridColumn:'1 / -1'}}>
+          <span style={{fontSize:12,color:'#555'}}>職業</span>
+          <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
+            <select ref={rOcc} defaultValue={occSel||""} onChange={e=>setOccSel(e.target.value)} style={{padding:8, minWidth:220}}>
+              <option value="">— 選択 —</option>
+              {OCCUPATIONS.map(o=> <option key={o} value={o}>{o}</option>)}
+            </select>
+            <input ref={rOccOther} defaultValue={OCCUPATIONS.includes(init.occupation||"") ? "" : (init.occupation||"")} placeholder="その他（自由記入）" style={{padding:8, minWidth:220, flex:'1 1 260px'}} disabled={occSel!=="その他"} />
+          </div>
+        </label>
+        <label style={{display:'grid', gap:4}}>
+          <span style={{fontSize:12,color:'#555'}}>本人確認種別</span>
+          <select ref={rIdType} defaultValue={init.idType} style={{padding:8}}>
+            {["運転免許証","マイナンバーカード","健康保険証","パスポート","在留カード","運転経歴証明書"].map(v=> <option key={v} value={v}>{v}</option>)}
+          </select>
+        </label>
+        <label style={{display:'grid', gap:4}}><span style={{fontSize:12,color:'#555'}}>本人確認番号</span><FieldInput refEl={rIdNum} def={init.idNumber} /></label>
+        <label style={{display:'grid', gap:4}}><span style={{fontSize:12,color:'#555'}}>有効期限</span><FieldInput refEl={rExpiry} def={init.idExpiry} type="date" /></label>
+      </div>
+      <div style={{display:'flex', gap:8}}>
+        <button onClick={onSave} style={{background:BRAND_RED, color:'#fff', padding:'8px 12px', border:'none', borderRadius:8}}>保存</button>
+        {saved && <span style={{color:'#16a34a'}}>保存しました</span>}
+      </div>
+    </section>
+  );
+}
+
+/** ========= Payment Method ========= **/
+function PaymentMethod(){
+  const init = loadJSON(LS.payment, { method:'現金' });
+  const [method, setMethod] = useState(init.method||'現金');
+  useEffect(()=>{ saveJSON(LS.payment, { method }); }, [method]);
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{fontWeight:700, color:BRAND_RED}}>支払方法</div>
+      <div style={{display:'flex', gap:16, alignItems:'center'}}>
+        {['現金','振込'].map(v=> (
+          <label key={v} style={{display:'flex', gap:6, alignItems:'center'}}>
+            <input type="radio" name="pay" value={v} checked={method===v} onChange={()=>setMethod(v)} /> {v}
+          </label>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/** ========= Staff Selector ========= **/
+function StaffSelector(){
+  const init = loadJSON(LS.staff, { name:"", list:["杉山 太一","田中","佐藤","鈴木"] });
+  const [name, setName] = useState(init.name||"");
+  const [list, setList] = useState(Array.isArray(init.list)&&init.list.length? init.list : ["杉山 太一","田中","佐藤","鈴木"]);
+  const [newName, setNewName] = useState("");
+  const [saved, setSaved] = useState(false);
+  const add = ()=>{ const n=(newName||"").trim(); if(n && !list.includes(n)){ setList([...list, n]); setNewName(""); } };
+  const save = ()=>{ saveJSON(LS.staff, { name, list }); setSaved(true); setTimeout(()=>setSaved(false), 900); };
+  useEffect(()=>{ saveJSON(LS.staff, { name, list }); }, [name, list]);
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{fontWeight:700, color:BRAND_RED}}>担当者（プルダウン選択）</div>
+      <div style={{display:'grid', gap:8, gridTemplateColumns:'repeat(auto-fit, minmax(240px, 1fr))'}}>
+        <label style={{display:'grid', gap:4}}>
+          <span style={{fontSize:12,color:'#555'}}>担当者</span>
+          <select value={name} onChange={e=>setName(e.target.value)} style={{padding:8}}>
+            <option value="">— 選択 —</option>
+            {list.map(n=> <option key={n} value={n}>{n}</option>)}
+          </select>
+        </label>
+        <label style={{display:'grid', gap:4}}>
+          <span style={{fontSize:12,color:'#555'}}>担当者の追加</span>
+          <div style={{display:'flex', gap:8}}>
+            <input value={newName} onChange={e=>setNewName(e.target.value)} placeholder="氏名を入力" style={{padding:8}} />
+            <button onClick={add} style={{padding:'8px 12px', border:'1px solid #ddd', background:'#fff', borderRadius:6}}>追加</button>
+          </div>
+          <span style={{fontSize:12,color:'#666'}}>※ 追加するとリストに反映されます</span>
+        </label>
+      </div>
+      <div style={{display:'flex', gap:8}}>
+        <button onClick={save} style={{background:BRAND_RED,color:'#fff',padding:'8px 12px',border:'none',borderRadius:8}}>保存</button>
+        {saved && <span style={{color:'#16a34a'}}>保存しました</span>}
+      </div>
+    </section>
+  );
+}
+
+/** ========= Lead & Coupon (Internal Only) ========= **/
+function LeadAndCoupon(){
+  const init = loadJSON(LS.lead, { channel:"", sub:"", detail:"", couponLetter:"", couponNumber:"" });
+  const [channel, setChannel] = useState(init.channel||"");
+  const [sub, setSub] = useState(init.sub||"");
+  const [detail, setDetail] = useState(init.detail||"");
+  const [couponLetter, setCouponLetter] = useState(init.couponLetter||"");
+  const [couponNumber, setCouponNumber] = useState(init.couponNumber||"");
+  const [saved, setSaved] = useState(false);
+  const CHANNELS = ["折り込み","ポスティング","店頭前声掛け","ティッシュ配布","SNS","LINE","リピート（元々の流入も）","口コミ","WEB（Google Map、LP、WEB検索）","看板","その他"];
+  const SUBMAP = {
+    "折り込み":["A","B","C"],
+    "ポスティング":["A","B","C"],
+    "SNS":["X(Twitter)","Instagram","TikTok","Facebook","YouTube","その他"],
+    "LINE":["公式LINE","個別LINE","その他"],
+    "WEB（Google Map、LP、WEB検索）":["Google Map","LP","WEB検索"],
+  };
+  useEffect(()=>{ if(!SUBMAP[channel]) setSub(""); }, [channel]);
+  const letters = Array.from({length:10}, (_,i)=> String.fromCharCode('A'.charCodeAt(0)+i)); // A..J
+  const numbers = Array.from({length:10}, (_,i)=> String(i+1)); // 1..10
+  const couponPreview = (couponLetter && couponNumber) ? `${couponLetter}-${String(couponNumber).padStart(2,'0')}` : "";
+  const onSave = () => { saveJSON(LS.lead, { channel, sub, detail, couponLetter, couponNumber }); setSaved(true); setTimeout(()=>setSaved(false), 900); };
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{fontWeight:700, color:BRAND_RED}}>流入経路・クーポン（社内控のみ）</div>
+      <div style={{display:'grid', gap:8, gridTemplateColumns:'repeat(auto-fit, minmax(240px, 1fr))'}}>
+        <label style={{display:'grid', gap:4}}>
+          <span style={{fontSize:12,color:'#555'}}>流入経路</span>
+          <select value={channel} onChange={e=>setChannel(e.target.value)} style={{padding:8}}>
+            <option value="">— 選択 —</option>
+            {CHANNELS.map(c=> <option key={c} value={c}>{c}</option>)}
+          </select>
+        </label>
+        {SUBMAP[channel] && (
+          <label style={{display:'grid', gap:4}}>
+            <span style={{fontSize:12,color:'#555'}}>詳細（サブ）</span>
+            <select value={sub} onChange={e=>setSub(e.target.value)} style={{padding:8}}>
+              <option value="">— 選択 —</option>
+              {SUBMAP[channel].map(s=> <option key={s} value={s}>{s}</option>)}
+            </select>
+          </label>
+        )}
+        <label style={{display:'grid', gap:4, gridColumn: SUBMAP[channel] ? '1 / -1' : 'auto'}}>
+          <span style={{fontSize:12,color:'#555'}}>詳細（自由記入・任意）</span>
+          <input value={detail} onChange={e=>setDetail(e.target.value)} style={{padding:8}} placeholder="例：配布場所／媒体名／担当者メモ など" />
+        </label>
+        <label style={{display:'grid', gap:4}}>
+          <span style={{fontSize:12,color:'#555'}}>クーポン（英字）</span>
+          <select value={couponLetter} onChange={e=>setCouponLetter(e.target.value)} style={{padding:8}}>
+            <option value="">—</option>
+            {letters.map(L=> <option key={L} value={L}>{L}</option>)}
+          </select>
+        </label>
+        <label style={{display:'grid', gap:4}}>
+          <span style={{fontSize:12,color:'#555'}}>クーポン（番号）</span>
+          <select value={couponNumber} onChange={e=>setCouponNumber(e.target.value)} style={{padding:8}}>
+            <option value="">—</option>
+            {numbers.map(n=> <option key={n} value={n}>{String(n).padStart(2,'0')}</option>)}
+          </select>
+        </label>
+        <div style={{display:'flex', alignItems:'flex-end', gap:8}}>
+          <div style={{fontSize:12, color:'#555'}}>プレビュー：</div>
+          <div style={{fontWeight:700}}>{couponPreview || '—'}</div>
+        </div>
+      </div>
+      <div style={{display:'flex', gap:8}}>
+        <button onClick={onSave} style={{background:BRAND_RED, color:'#fff', padding:'8px 12px', border:'none', borderRadius:8}}>保存</button>
+        {saved && <span style={{color:'#16a34a'}}>保存しました</span>}
+        <div style={{fontSize:12, color:'#666'}}>※ お客様控えには表示しません。社内控プレビューでのみ表示。</div>
+      </div>
+    </section>
+  );
+}
+
+/** ========= ブランドマスター（設定） ========= **/
+function BrandMasterSection(){
+  const init = loadArray(LS.brands);
+  const [brands, setBrands] = React.useState((Array.isArray(init) && init.length)? init : DEFAULT_BRANDS);
+  const [newName, setNewName] = React.useState("");
+  const [saved, setSaved] = React.useState(false);
+  const add = ()=>{ const n=(newName||"").trim(); if(!n) return; if(!brands.includes(n)){ setBrands([...brands, n]); } setNewName(""); };
+  const remove = (i)=> setBrands(brands.filter((_,idx)=> idx!==i));
+  const up = (i)=> { if(i<=0) return; const a=[...brands]; [a[i-1],a[i]]=[a[i],a[i-1]]; setBrands(a); };
+  const down = (i)=> { if(i>=brands.length-1) return; const a=[...brands]; [a[i+1],a[i]]=[a[i],a[i+1]]; setBrands(a); };
+  const save = ()=>{ saveArray(LS.brands, brands); setSaved(true); setTimeout(()=>setSaved(false), 900); };
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{fontWeight:700, color:BRAND_RED}}>ブランドマスター（ブランド/バッグの品目に反映）</div>
+      <div style={{display:'grid', gap:8, gridTemplateColumns:'repeat(auto-fit, minmax(260px, 1fr))'}}>
+        <div style={{display:'grid', gap:6}}>
+          <div style={{fontSize:12,color:'#555'}}>登録ブランド</div>
+          <ul style={{listStyle:'none', padding:0, margin:0, border:'1px solid #eee', borderRadius:8, maxHeight:220, overflow:'auto'}}>
+            {brands.map((b,i)=> (
+              <li key={b+"_"+i} style={{display:'flex', alignItems:'center', justifyContent:'space-between', padding:'6px 8px', borderBottom:'1px solid #f3f4f6'}}>
+                <span>{b}</span>
+                <span style={{display:'flex', gap:6}}>
+                  <button onClick={()=>up(i)} style={{padding:'4px 8px'}}>↑</button>
+                  <button onClick={()=>down(i)} style={{padding:'4px 8px'}}>↓</button>
+                  <button onClick={()=>remove(i)} style={{padding:'4px 8px'}}>削除</button>
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+        <div style={{display:'grid', gap:6}}>
+          <div style={{fontSize:12,color:'#555'}}>ブランドを追加</div>
+          <div style={{display:'flex', gap:8}}>
+            <input value={newName} onChange={e=>setNewName(e.target.value)} placeholder="例：CHANEL" style={{padding:8, flex:'1 1 200px'}} />
+            <button onClick={add} style={{padding:'8px 12px', border:'1px solid #ddd', background:'#fff', borderRadius:6}}>追加</button>
+          </div>
+          <div style={{display:'flex', gap:8}}>
+            <button onClick={save} style={{background:BRAND_RED, color:'#fff', padding:'8px 12px', border:'none', borderRadius:8}}>保存</button>
+            {saved && <span style={{color:'#16a34a'}}>保存しました</span>}
+          </div>
+          <div style={{fontSize:12, color:'#666'}}>※ 保存後、「査定計算表」のカテゴリ=ブランド/バッグの品目プルダウンへ反映されます。</div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/** ========= カテゴリ／品目マスター（設定） ========= **/
+function CategoryItemMasterSection(){
+  const initCats = loadArray(LS.categories);
+  const [cats, setCats] = React.useState((Array.isArray(initCats)&&initCats.length)? initCats : DEFAULT_CATEGORIES);
+  const [sel, setSel] = React.useState((Array.isArray(initCats)&&initCats.length)? initCats[0] : (DEFAULT_CATEGORIES[0]||''));
+  const initMap = (()=>{ try{ const j=JSON.parse(localStorage.getItem(LS.itemsMaster)||'null'); return (j&&typeof j==='object')? j : DEFAULT_ITEM_MASTER; }catch{ return DEFAULT_ITEM_MASTER; }})();
+  const [map, setMap] = React.useState(initMap);
+  const [newCat, setNewCat] = React.useState("");
+  const [newItem, setNewItem] = React.useState("");
+  const [saved, setSaved] = React.useState(false);
+
+  // カテゴリ操作
+  const addCat = ()=>{ const n=(newCat||"").trim(); if(!n) return; if(!cats.includes(n)){ setCats([...cats, n]); if(!map[n]) setMap({...map, [n]: []}); setSel(n); setNewCat(""); } };
+  const delCat = (i)=>{ const name=cats[i]; const a=cats.filter((_,idx)=>idx!==i); setCats(a); const m={...map}; delete m[name]; setMap(m); if(sel===name) setSel(a[0]||''); };
+  const upCat = (i)=>{ if(i<=0) return; const a=[...cats]; [a[i-1],a[i]]=[a[i],a[i-1]]; setCats(a); };
+  const downCat = (i)=>{ if(i>=cats.length-1) return; const a=[...cats]; [a[i+1],a[i]]=[a[i],a[i+1]]; setCats(a); };
+
+  // アイテム操作
+  const items = map[sel] || [];
+  const setItems = (arr)=> setMap(prev=> ({...prev, [sel]: arr}));
+  const addItem = ()=>{ const n=(newItem||"").trim(); if(!n) return; if(!items.includes(n)){ setItems([...(items||[]), n]); setNewItem(""); } };
+  const delItem = (i)=> setItems(items.filter((_,idx)=> idx!==i));
+  const upItem = (i)=>{ if(i<=0) return; const a=[...items]; [a[i-1],a[i]]=[a[i],a[i-1]]; setItems(a); };
+  const downItem = (i)=>{ if(i>=items.length-1) return; const a=[...items]; [a[i+1],a[i]]=[a[i],a[i+1]]; setItems(a); };
+
+  const save = ()=>{ saveArray(LS.categories, cats); try{ localStorage.setItem(LS.itemsMaster, JSON.stringify(map||{})); }catch{} setSaved(true); setTimeout(()=>setSaved(false), 900); };
+
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{fontWeight:700, color:BRAND_RED}}>カテゴリ／品目マスター</div>
+      <div style={{display:'grid', gap:12, gridTemplateColumns:'repeat(auto-fit, minmax(280px, 1fr))'}}>
+        <div style={{display:'grid', gap:6}}>
+          <div style={{fontSize:12,color:'#555'}}>カテゴリ一覧</div>
+          <ul style={{listStyle:'none', padding:0, margin:0, border:'1px solid #eee', borderRadius:8, maxHeight:220, overflow:'auto'}}>
+            {cats.map((c,i)=> (
+              <li key={c+"_"+i} style={{display:'flex', alignItems:'center', justifyContent:'space-between', padding:'6px 8px', borderBottom:'1px solid #f3f4f6', background: sel===c? '#fff5f5':'#fff'}}>
+                <span style={{cursor:'pointer'}} onClick={()=>setSel(c)}>{c}</span>
+                <span style={{display:'flex', gap:6}}>
+                  <button onClick={()=>upCat(i)} style={{padding:'4px 8px'}}>↑</button>
+                  <button onClick={()=>downCat(i)} style={{padding:'4px 8px'}}>↓</button>
+                  <button onClick={()=>delCat(i)} style={{padding:'4px 8px'}}>削除</button>
+                </span>
+              </li>
+            ))}
+          </ul>
+          <div style={{display:'flex', gap:8, marginTop:6}}>
+            <input value={newCat} onChange={e=>setNewCat(e.target.value)} placeholder="カテゴリを追加" style={{padding:8, flex:'1 1 140px'}} />
+            <button onClick={addCat} style={{padding:'8px 12px', border:'1px solid #ddd', background:'#fff', borderRadius:6}}>追加</button>
+          </div>
+        </div>
+        <div style={{display:'grid', gap:6}}>
+          <div style={{fontSize:12,color:'#555'}}>品目一覧（カテゴリ：{sel||'—'}）</div>
+          <ul style={{listStyle:'none', padding:0, margin:0, border:'1px solid #eee', borderRadius:8, maxHeight:220, overflow:'auto'}}>
+            {(items||[]).map((n,i)=> (
+              <li key={n+"_"+i} style={{display:'flex', alignItems:'center', justifyContent:'space-between', padding:'6px 8px', borderBottom:'1px solid #f3f4f6'}}>
+                <span>{n}</span>
+                <span style={{display:'flex', gap:6}}>
+                  <button onClick={()=>upItem(i)} style={{padding:'4px 8px'}}>↑</button>
+                  <button onClick={()=>downItem(i)} style={{padding:'4px 8px'}}>↓</button>
+                  <button onClick={()=>delItem(i)} style={{padding:'4px 8px'}}>削除</button>
+                </span>
+              </li>
+            ))}
+          </ul>
+          <div style={{display:'flex', gap:8, marginTop:6}}>
+            <input value={newItem} onChange={e=>setNewItem(e.target.value)} placeholder="品目を追加" style={{padding:8, flex:'1 1 140px'}} />
+            <button onClick={addItem} style={{padding:'8px 12px', border:'1px solid #ddd', background:'#fff', borderRadius:6}}>追加</button>
+          </div>
+          <div style={{display:'flex', gap:8}}>
+            <button onClick={save} style={{background:BRAND_RED, color:'#fff', padding:'8px 12px', border:'none', borderRadius:8}}>保存</button>
+            {saved && <span style={{color:'#16a34a'}}>保存しました</span>}
+          </div>
+          <div style={{fontSize:12, color:'#666'}}>※ 「保存」で査定計算表のプルダウンに即反映されます。ブランド/バッグの品目は「ブランドマスター」を優先します。</div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/** ========= 相場（手動）入力 ========= **/
+function PricesManualSection(){
+  const init = loadJSON(LS.prices, DEFAULT_PRICES);
+  const [data, setData] = useState(init);
+  const [saved, setSaved] = useState(false);
+  const FIELDS = [
+    {k:'K24', label:'K24（金）'}, {k:'K22', label:'K22（金）'}, {k:'K20', label:'K20（金）'}, {k:'K18', label:'K18（金）'},
+    {k:'K14', label:'K14（金）'}, {k:'K12', label:'K12（金）'}, {k:'K10', label:'K10（金）'}, {k:'K9', label:'K9（金）'},
+    {k:'Pt1000', label:'Pt1000（プラチナ）'}, {k:'Pt950', label:'Pt950'}, {k:'Pt900', label:'Pt900'}, {k:'Pt850', label:'Pt850'},
+    {k:'SV1000', label:'SV1000（銀）'}, {k:'SV925', label:'SV925'},
+    {k:'K18_Pt900', label:'K18/Pt900（コンビ）'}, {k:'K18_Pt850', label:'K18/Pt850（コンビ）'}, {k:'Pt900_K18', label:'Pt900/K18（コンビ）'}, {k:'Pt850_K18', label:'Pt850/K18（コンビ)'}
+  ];
+  const setField = (k, v) => setData(d => ({...d, [k]: Number(v)||0}));
+  const onSave = () => { saveJSON(LS.prices, data); setSaved(true); setTimeout(()=>setSaved(false), 900); };
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{fontWeight:700, color:BRAND_RED}}>相場（手動）入力</div>
+      <div style={{fontSize:12,color:'#666'}}>※ RE:TANAKA/ネットジャパンの自動取得が未設定のため、ここで相場(¥/g)を手動登録します。保存後は査定で参照できます。</div>
+      <div style={{display:'grid', gap:8, gridTemplateColumns:'repeat(auto-fit, minmax(180px, 1fr))'}}>
+        {FIELDS.map(f=> (
+          <label key={f.k} style={{display:'grid', gap:4}}>
+            <span style={{fontSize:12,color:'#555'}}>{f.label}</span>
+            <input type="number" inputMode="numeric" value={data[f.k]??0} onChange={e=>setField(f.k, e.target.value)} style={{padding:8, textAlign:'right'}} placeholder="0" />
+          </label>
+        ))}
+      </div>
+      <div style={{display:'flex', gap:8}}>
+        <button onClick={onSave} style={{background:BRAND_RED, color:'#fff', padding:'8px 12px', border:'none', borderRadius:8}}>保存</button>
+        {saved && <span style={{color:'#16a34a'}}>保存しました</span>}
+      </div>
+    </section>
+  );
+}
+
+/** ========= Items Editor (統合査定テーブル) ========= **/
+function ItemsEditor(){
+  const [items, setItems] = useState(()=> loadArray(LS.items));
+  useEffect(()=>{ const h = ()=> setItems([]); window.addEventListener('CLEAR_ITEMS', h); return ()=> window.removeEventListener('CLEAR_ITEMS', h); },[]);
+  useEffect(()=>{ saveLater(LS.items, items, true, 150); }, [items]);
+  // 外部からの復元に対応（スナップショット→RELOAD_ITEMS）
+  useEffect(()=>{ const h=()=> setItems(loadArray(LS.items)); window.addEventListener('RELOAD_ITEMS', h); return ()=> window.removeEventListener('RELOAD_ITEMS', h); },[]);
+
+  const prices = loadJSON(LS.prices, DEFAULT_PRICES);
+  const brands = (()=>{ const b = loadArray(LS.brands); return (Array.isArray(b) && b.length) ? b : DEFAULT_BRANDS; })();
+  const categoryMaster = (()=>{ const a = loadArray(LS.categories); return (Array.isArray(a)&&a.length)? a : DEFAULT_CATEGORIES; })();
+  const itemMaster = (()=>{ try{ const j = JSON.parse(localStorage.getItem(LS.itemsMaster)||"null"); return (j && typeof j==='object') ? j : DEFAULT_ITEM_MASTER; }catch{ return DEFAULT_ITEM_MASTER; } })();
+
+  const metalKeyFromLabel = (label)=>{ const m = METAL_ITEMS.find(x=>x.label===label); return m? m.k : label; };
+
+  const addRow = () => setItems(prev=>[
+    ...prev,
+    {selected:true, category:'貴金属', item:'K18', detail:'', qty:1, unit:(prices['K18']||0), rate:10, priceKey:'K18', sync:true, payoutMode:'auto', payoutManual:0}
+  ]);
+  const delRow = (i) => setItems(prev=> prev.filter((_,idx)=> idx!==i));
+  const upd = (i, k, v) => setItems(prev => prev.map((r, idx) => { if (idx !== i) return r; if (k == null) { return { ...r, ...(v||{}) }; } return { ...r, [k]: v }; }));
+
+  const applyFromPrice = (i, priceKey) => { setItems(prev=> prev.map((r,idx)=>{ if(idx!==i) return r; const unit = Number(prices[priceKey]||0); return { ...r, unit, priceKey, sync:true }; })); };
+
+  const sale   = (r) => Number(r.unit||0) * Number(r.qty||0);
+  const autoPayout = (r) => floor100(sale(r) * Number(r.rate||0) / 10);
+  const payout = (r) => (r.payoutMode==='manual' ? floor100(Number(r.payoutManual||0)) : autoPayout(r));
+  const profit = (r) => sale(r) - payout(r);
+
+  // 買いこぼしへ送る
+  const toMissed = (r) => {
+    const now = new Date();
+    const offer = (r.payoutMode==='manual' ? floor100(Number(r.payoutManual||0)) : autoPayout(r));
+    appendMissed({
+      date: now.toISOString(),
+      category: r.category||'',
+      name: r.name || [r.item, r.detail].filter(Boolean).join(' '),
+      qty: Number(r.qty||0),
+      offer: offer,
+      unit: Number(r.unit||0),
+      rate: Number(r.rate||0),
+      reason: '',
+      memo: '',
+      next: '',
+      staff: (loadJSON(LS.staff, {name:''}).name||'')
+    });
+  };
+
+  // 一括：相場から再適用（同期ONの貴金属行のみ）
+  const reapplyAll = async () => {
+    const targetIdxs = items.map((r,i)=> (r.category==='貴金属' && r.sync && r.priceKey) ? i : -1).filter(i=> i>=0);
+    if(!targetIdxs.length){ showToast('対象行がありません','warn'); return; }
+    showToast('相場を適用中…');
+    const chunk = 50;
+    let updated = [...items];
+    for(let i=0; i<targetIdxs.length; i+=chunk){
+      for(let j=i; j<Math.min(i+chunk, targetIdxs.length); j++){
+        const idx = targetIdxs[j];
+        const r = updated[idx];
+        const unit = Number(prices[r.priceKey]||0);
+        updated[idx] = { ...r, unit };
+      }
+      setItems(updated);
+      await new Promise(res=> setTimeout(res, 0));
+    }
+    showToast('相場を再適用しました');
+  };
+
+  const memoTotals = React.useMemo(()=>{
+    const sel = items.filter(r=>r.selected);
+    const totalSale   = sel.reduce((s,r)=> s + sale(r), 0);
+    const totalPayout = sel.reduce((s,r)=> s + payout(r), 0);
+    const totalProfit = totalSale - totalPayout;
+    const totalTax    = Math.floor(totalPayout * 0.10);
+    const totalInc    = totalPayout + totalTax;
+    const totalQtySel = sel.reduce((s,r)=> s + Number(r.qty||0), 0);
+    return { totalSale, totalPayout, totalProfit, totalTax, totalInc, totalQtySel };
+  }, [items]);
+  const { totalSale, totalPayout, totalProfit, totalTax, totalInc, totalQtySel } = memoTotals;
+
+  // keyboard events for quick actions in this table
+  useEffect(()=>{
+    const onAdd = ()=> addRow();
+    const onReapply = ()=> reapplyAll();
+    window.addEventListener('ADD_ITEM_ROW', onAdd);
+    window.addEventListener('REAPPLY_PRICES', onReapply);
+    return ()=> {
+      window.removeEventListener('ADD_ITEM_ROW', onAdd);
+      window.removeEventListener('REAPPLY_PRICES', onReapply);
+    };
+  }, [addRow, reapplyAll]);
+
+  const renderItemCell = (r,i) => {
+    let itemsList = (r.category==='ブランド' || r.category==='バッグ') ? brands : (itemMaster[r.category] || []);
+    const detailsList = DETAIL_MAP[r.category] || [];
+
+    if(r.category==='貴金属'){
+      return (
+        <div style={{display:'grid', gap:6}}>
+          {r.manualItem ? (
+            <>
+              <input value={r.item||''} onChange={e=>{ const v=e.target.value; upd(i,'item', v); upd(i,'name', (v||'') + (r.detail? ' '+r.detail:'')); }} placeholder="品目を手入力（例：K18ネックレス）" style={{padding:6}} />
+              <button onClick={()=>upd(i, null, { ...r, manualItem:false })} style={{padding:'4px 8px'}}>プルダウンに戻す</button>
+            </>
+          ) : (
+            <>
+              <select value={r.item||''} onChange={e=>{ const lbl=e.target.value; if (lbl===MANUAL_OPTION){ upd(i, null, { ...r, manualItem:true, sync:false, priceKey:'' }); return; } const key=metalKeyFromLabel(lbl); upd(i,'item', lbl); upd(i,'name', lbl + (r.detail? ' '+r.detail:'')); applyFromPrice(i, key); }} style={{padding:6}}>
+                <option value={MANUAL_OPTION}>（手入力）</option>
+                {METAL_ITEMS.map(m=> <option key={m.k} value={m.label}>{m.label}</option>)}
+              </select>
+              <select value={r.detail||''} onChange={e=>{ const d=e.target.value; upd(i,'detail', d); upd(i,'name', (r.item||'') + (d? ' '+d:'')); }} style={{padding:6}}>
+                <option value="">— 詳細 —</option>
+                {detailsList.map(d=> <option key={d} value={d}>{d}</option>)}
+              </select>
+              <label style={{display:'flex',alignItems:'center',gap:6,fontSize:12,color:'#555'}}>
+                <input type="checkbox" checked={!!r.sync} onChange={e=>upd(i,'sync', e.target.checked)} /> 相場と単価を同期
+              </label>
+            </>
+          )}
+        </div>
+      );
+    }
+
+    return (
+      <div style={{display:'grid', gap:6}}>
+        {r.manualItem ? (
+          <>
+            <input value={r.item||''} onChange={e=>{ const v=e.target.value; upd(i,'item', v); upd(i,'name', (v||'') + (r.detail? ' '+r.detail:'')); }} placeholder="品目を手入力" style={{padding:6}} />
+            <button onClick={()=>upd(i, null, { ...r, manualItem:false })} style={{padding:'4px 8px'}}>プルダウンに戻す</button>
+          </>
+        ) : (
+          <>
+            <select value={r.item||''} onChange={e=>{ const v=e.target.value; if (v===MANUAL_OPTION){ upd(i, null, { ...r, manualItem:true }); return; } upd(i,'item', v); upd(i,'name', v + (r.detail? ' '+r.detail:'')); }} style={{padding:6}}>
+              <option value={MANUAL_OPTION}>（手入力）</option>
+              <option value="">— 品目 —</option>
+              {itemsList.map(n=> <option key={n} value={n}>{n}</option>)}
+            </select>
+            <select value={r.detail||''} onChange={e=>{ const d=e.target.value; upd(i,'detail', d); upd(i,'name', (r.item||'') + (d? ' '+d:'')); }} style={{padding:6}}>
+              <option value="">— 詳細 —</option>
+              {detailsList.map(d=> <option key={d} value={d}>{d}</option>)}
+            </select>
+          </>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{fontWeight:700, color:BRAND_RED}}>査定計算表（統合）</div>
+      <div style={{display:'flex', gap:8, flexWrap:'wrap', alignItems:'center'}}>
+        <button onClick={addRow} style={{background:'#111', color:'#fff', padding:'8px 12px', border:'none', borderRadius:8}}>行を追加</button>
+        <button onClick={reapplyAll} style={{background:'#fff', color:'#111', padding:'8px 12px', border:'1px solid #111', borderRadius:8}}>相場から再適用</button>
+        <span style={{fontSize:12,color:'#666'}}>※「貴金属」行で「相場と単価を同期」がONの行に適用</span>
+      </div>
+      <div style={{overflowX:'auto'}}>
+        <table style={{borderCollapse:'collapse', width:'100%'}}>
+          <thead>
+            <tr style={{background:'#f9fafb'}}>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>No.</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>✓</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>カテゴリ</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>品目／詳細</th>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>数量</th>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>売却見込(¥/単位)</th>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>掛け率(1–10)</th>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>上代(税抜)</th>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>支払(税抜)</th>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>粗利</th>
+              <th style={{border:'1px solid #ddd', padding:6}}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((r,i)=> (
+              <tr key={i} style={{ background: r.selected ? '#fff8f8' : undefined }}>
+                <td style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>{i+1}</td>
+                <td style={{border:'1px solid #ddd', padding:6}}><input type="checkbox" checked={!!r.selected} onChange={e=>upd(i,'selected', e.target.checked)} /></td>
+                <td style={{border:'1px solid #ddd', padding:6}}>
+                  <div style={{display:'grid', gap:6}}>
+                    <select value={r.categoryManual? MANUAL_OPTION : (r.category||'')} onChange={e=>{
+                      const val = e.target.value;
+                      if (val===MANUAL_OPTION){
+                        upd(i, null, { ...r, categoryManual:true, category:'', item:'', detail:'', name:'', sync:false, priceKey:'' });
+                        return;
+                      }
+                      const cat = val;
+                      const firstItem = (cat==='ブランド' || cat==='バッグ') ? (brands[0]||'') : ((itemMaster[cat]||[])[0]||'');
+                      let patch={ category:cat, categoryManual:false };
+                      if(cat==='貴金属'){
+                        const key=metalKeyFromLabel(firstItem||'K18');
+                        patch={...patch, item:firstItem||'K18', detail:'', unit:(prices[key]||0), priceKey:key, sync:true, name:firstItem};
+                      } else {
+                        patch = { ...patch, item:firstItem||'', detail:'', name:firstItem||'', sync:false, priceKey:'' };
+                      }
+                      upd(i, null, {...r, ...patch});
+                    }} style={{padding:6}}>
+                      <option value={MANUAL_OPTION}>（手入力）</option>
+                      {categoryMaster.map(c=> <option key={c} value={c}>{c}</option>)}
+                    </select>
+                    {r.categoryManual && (
+                      <input value={r.category||''} onChange={e=>upd(i,'category', e.target.value)} placeholder="カテゴリを手入力" style={{padding:6}} />
+                    )}
+                  </div>
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6}}>{renderItemCell(r,i)}</td>
+                <td style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>
+                  <input type="number" value={r.qty||0} onChange={e=>upd(i,'qty', Number(e.target.value))} style={{padding:6, width:90, textAlign:'right'}} />
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>
+                  <input type="number" value={r.unit||0} onChange={e=>upd(i,'unit', Number(e.target.value))} style={{padding:6, width:120, textAlign:'right'}} />
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>
+                  <select value={r.rate||10} onChange={e=>upd(i,'rate', Number(e.target.value))} style={{padding:6}}>
+                    {[1,2,3,4,5,6,7,8,9,10].map(n=> <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>¥{sale(r).toLocaleString()}</td>
+                <td style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>
+                  {r.payoutMode==='manual' ? (
+                    <div style={{display:'grid', gap:4}}>
+                      <input type="number" value={r.payoutManual||0} onChange={e=>upd(i,'payoutManual', Number(e.target.value))} style={{padding:6, width:140, textAlign:'right'}} />
+                      <div style={{fontSize:12,color:'#666'}}>自動計算: ¥{autoPayout(r).toLocaleString()}</div>
+                      <button onClick={()=>upd(i, null, { ...r, payoutMode:'auto' })} style={{padding:'4px 8px'}}>自動に戻す</button>
+                    </div>
+                  ) : (
+                    <div style={{display:'flex', gap:6, justifyContent:'flex-end', alignItems:'center'}}>
+                      <span>¥{payout(r).toLocaleString()}</span>
+                      <button onClick={()=>upd(i, null, { ...r, payoutMode:'manual', payoutManual: autoPayout(r) })} style={{padding:'4px 8px'}}>手動入力</button>
+                    </div>
+                  )}
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6, textAlign:'right', color: profit(r)<0?'#E60012':'#111'}}>¥{profit(r).toLocaleString()}</td>
+                <td style={{border:'1px solid #ddd', padding:6}}>
+                  <div style={{display:'grid', gap:6}}>
+                    <button onClick={()=>toMissed(r)} style={{padding:'4px 8px'}}>→ 買いこぼし</button>
+                    <button onClick={()=>delRow(i)} style={{padding:'4px 8px'}}>削除</button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div style={{display:'flex', gap:8, alignItems:'center', justifyContent:'space-between', flexWrap:'wrap'}}>
+        <div style={{fontSize:13}}>
+          <div>点数合計（✓） {totalQtySel} 点</div>
+        </div>
+        <div style={{marginLeft:'auto', textAlign:'right'}}>
+          <div>上代合計（税抜） ¥{totalSale.toLocaleString()}</div>
+          <div>小計（税抜） ¥{totalPayout.toLocaleString()}</div>
+          <div>粗利合計 ¥{totalProfit.toLocaleString()}</div>
+          <div>消費税(10%) ¥{totalTax.toLocaleString()}</div>
+          <div style={{fontWeight:700}}>税込合計 ¥{totalInc.toLocaleString()}</div>
+        </div>
+      </div>
+    </section>
+  );
+}
+/** ========= Store Code Setting ========= **/
+function StoreCodeSetting(){
+  const init = loadJSON(LS.storeCode, { code: 'KI' });
+  const [code, setCode] = useState(init.code || 'KI');
+  const [saved, setSaved] = useState(false);
+  const onSave = () => { const c = (code||'KI').toUpperCase().replace(/[^A-Z0-9-]/g,'').slice(0,8); saveJSON(LS.storeCode, { code: c }); setSaved(true); setTimeout(()=>setSaved(false), 900); };
+  const resetSeq = () => { try{ localStorage.removeItem(`${(code||'KI')}-seq`); showToast('当日の連番をリセットしました'); }catch{} };
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{fontWeight:700, color:BRAND_RED}}>店舗コード（契約番号の接頭辞）</div>
+      <div style={{display:'flex', gap:8, alignItems:'center', flexWrap:'wrap'}}>
+        <input value={code} onChange={e=>setCode(e.target.value)} style={{padding:8, width:160}} placeholder="例：KI" />
+        <button onClick={onSave} style={{background:BRAND_RED,color:'#fff',padding:'8px 12px',border:'none',borderRadius:8}}>保存</button>
+        <button onClick={resetSeq} style={{background:'#fff',color:'#111',padding:'8px 12px',border:'1px solid #111',borderRadius:8}}>当日の連番をリセット</button>
+        {saved && <span style={{color:'#16a34a'}}>保存しました</span>}
+      </div>
+      <div style={{fontSize:12,color:'#666'}}>※ 契約番号は「<b>店舗コード-YYYYMMDD-連番</b>」形式です。</div>
+    </section>
+  );
+}
+
+/** ========= 基本設定（保存期間・起動時の新規） ========= **/
+function BasicSettingsSection(){
+  const init = loadSettings();
+  const [ret, setRet] = React.useState(Number(init.retentionDays||60));
+  const [startNew, setStartNew] = React.useState(!!init.newSheetOnLaunch);
+  const save = ()=>{ saveSettings({ retentionDays: Number(ret)||60, newSheetOnLaunch: !!startNew }); showToast('保存しました'); };
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{fontWeight:700, color:BRAND_RED}}>基本設定</div>
+      <div style={{display:'grid', gap:8, gridTemplateColumns:'repeat(auto-fit, minmax(240px, 1fr))'}}>
+        <label style={{display:'grid', gap:4}}>
+          <span style={{fontSize:12,color:'#555'}}>保存期間（日数）</span>
+          <select value={ret} onChange={e=>setRet(Number(e.target.value))} style={{padding:8}}>
+            {[2,7,30,90,365].map(d=> <option key={d} value={d}>{d}日</option>)}
+          </select>
+        </label>
+        <label style={{display:'flex', gap:8, alignItems:'center'}}>
+          <input type="checkbox" checked={startNew} onChange={e=>setStartNew(e.target.checked)} />
+          <span>次回起動時に明細を自動クリア（新規で開始）</span>
+        </label>
+      </div>
+      <div style={{display:'flex', gap:8}}>
+        <button onClick={save} style={{background:BRAND_RED,color:'#fff',padding:'8px 12px',border:'none',borderRadius:8}}>保存</button>
+      </div>
+    </section>
+  );
+}
+
+/** ========= Signatures ========= **/
+function SignaturePad({ label, lsKey, height=160 }){
+  const canvasRef = useRef(null);
+  const [drawing, setDrawing] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const pos = useRef({x:0,y:0});
+  useEffect(()=>{
+    const c = canvasRef.current; if(!c) return; const ctx=c.getContext('2d'); ctx.lineWidth=2; ctx.lineCap='round'; ctx.strokeStyle='#111';
+    const savedData = getSig(lsKey); if(savedData){ const img=new Image(); img.onload=()=>{ ctx.clearRect(0,0,c.width,c.height); ctx.drawImage(img,0,0,c.width,c.height); }; img.src=savedData; }
+  },[lsKey]);
+  const getXY = (e, el) => { const rect = el.getBoundingClientRect(); const client = e.touches ? e.touches[0] : e; return { x: client.clientX - rect.left, y: client.clientY - rect.top }; };
+  const start = (e)=>{ const c=canvasRef.current; if(!c) return; const ctx=c.getContext('2d'); setDrawing(true); const p=getXY(e,c); pos.current=p; ctx.beginPath(); ctx.moveTo(p.x,p.y); };
+  const move  = (e)=>{ if(!drawing) return; const c=canvasRef.current; const ctx=c.getContext('2d'); const p=getXY(e,c); ctx.lineTo(p.x,p.y); ctx.stroke(); pos.current=p; if(e.cancelable) e.preventDefault(); };
+  const end   = ()=> setDrawing(false);
+  const handleClear = ()=>{ const c=canvasRef.current; const ctx=c.getContext('2d'); ctx.clearRect(0,0,c.width,c.height); setSig(lsKey,""); };
+  const handleSave  = ()=>{ const c=canvasRef.current; const data=c.toDataURL('image/png'); setSig(lsKey,data); setSaved(true); setTimeout(()=>setSaved(false),900); };
+  return (
+    <div style={{display:'grid', gap:6}}>
+      <div style={{fontSize:12,color:'#555'}}>{label}</div>
+      <canvas ref={canvasRef} width={600} height={height} style={{width:'100%',border:'1px solid #ddd',borderRadius:8,background:'#fff'}}
+        onMouseDown={start} onMouseMove={move} onMouseUp={end} onMouseLeave={end}
+        onTouchStart={start} onTouchMove={move} onTouchEnd={end}
+      />
+      <div style={{display:'flex', gap:8}}>
+        <button onClick={handleSave} style={{background:BRAND_RED,color:'#fff',padding:'6px 10px',border:'none',borderRadius:8}}>保存</button>
+        <button onClick={handleClear} style={{background:'#fff',color:'#111',padding:'6px 10px',border:'1px solid #111',borderRadius:8}}>消去</button>
+        {saved && <span style={{color:'#16a34a'}}>保存しました</span>}
+      </div>
+    </div>
+  );
+}
+function SignaturesSection(){
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{fontWeight:700, color:BRAND_RED}}>署名（端末で手書き保存）</div>
+      <div style={{display:'grid', gap:12, gridTemplateColumns:'repeat(auto-fit, minmax(280px, 1fr))'}}>
+        <SignaturePad label="お客様署名" lsKey={LS.signCustomer} />
+      </div>
+      <div style={{fontSize:12,color:'#666'}}>※ 保存後、プレビュー末尾に画像として表示・印刷されます。</div>
+    </section>
+  );
+}
+
+/* ========= Summary Editor (editable daily logs) ========= */
+function SummaryEditor(){
+  const [date, setDate] = React.useState(new Date().toISOString().slice(0,10));
+  const [rows, setRows] = React.useState([]);
+  const [indexMap, setIndexMap] = React.useState([]);
+  React.useEffect(()=>{
+    const all = loadLogs();
+    const list = []; const idxs = [];
+    all.forEach((l,idx)=>{
+      const day = (l.date||'').slice(0,10);
+      if(day===date){
+        list.push({
+          time: (l.time||'').slice(11,19) || '',
+          contractNo: l.contractNo||'',
+          saleTotal: Number(l.saleTotal||0),
+          payoutTotal: Number(l.payoutTotal||0),
+          profitTotal: Number(l.profitTotal||0),
+          leadShort: l.leadShort||'',
+          age: l.age||'',
+          gender: l.gender||'',
+          staff: l.staff||'',
+          lines: Number(l.lines||0),
+          _delete:false,
+        });
+        idxs.push(idx);
+      }
+    });
+    setRows(list); setIndexMap(idxs);
+  },[date]);
+  const setField = (i,k,v)=> setRows(prev=> prev.map((r,idx)=> idx===i? {...r,[k]: v}: r));
+  const addRow = ()=> setRows(prev=> [...prev, { time:'12:00:00', contractNo:'', saleTotal:0, payoutTotal:0, profitTotal:0, leadShort:'', age:'', gender:'', staff:'', lines:0, _new:true, _delete:false }]);
+  const toggleDel = (i)=> setRows(prev=> prev.map((r,idx)=> idx===i? {...r, _delete:!r._delete}: r));
+  const save = ()=>{
+    const all = loadLogs();
+    // delete targets
+    const delSet = new Set();
+    rows.forEach((r,i)=>{ const idx=indexMap[i]; if(r._delete && idx!=null) delSet.add(idx); });
+    let newAll = all.filter((_,idx)=> !delSet.has(idx));
+    // update
+    rows.forEach((r,i)=>{
+      const idx = indexMap[i];
+      if(idx!=null && !r._delete){
+        const profit = Number(r.saleTotal||0) - Number(r.payoutTotal||0);
+        const base = newAll[idx] || {};
+        newAll[idx] = { ...base,
+          saleTotal: Number(r.saleTotal||0),
+          payoutTotal: Number(r.payoutTotal||0),
+          profitTotal: profit,
+          leadShort: r.leadShort||'', age: r.age||'', gender: r.gender||'', staff: r.staff||'',
+          lines: Number(r.lines||0),
+          contractNo: r.contractNo || base.contractNo || '',
+          time: base.time || base.date || (date+'T'+(r.time||'12:00:00')), date: base.date || (date+'T'+(r.time||'12:00:00'))
+        };
+      }
+    });
+    // add new rows
+    rows.forEach((r)=>{
+      if(r._new && !r._delete){
+        const profit = Number(r.saleTotal||0) - Number(r.payoutTotal||0);
+        const dt = date + 'T' + (r.time||'12:00:00');
+        newAll.push({ date: dt, time: dt, contractNo: r.contractNo||'', saleTotal: Number(r.saleTotal||0), payoutTotal: Number(r.payoutTotal||0), profitTotal: profit, lines: Number(r.lines||0), leadShort: r.leadShort||'', age: r.age||'', gender: r.gender||'', staff: r.staff||'', items: [], payment:'', customerName:'' });
+      }
+    });
+    saveLogs(newAll);
+    showToast('日次集計を保存しました');
+  };
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{fontWeight:700, color:BRAND_RED}}>日次集計（編集）</div>
+      <div style={{display:'flex', gap:8, alignItems:'center'}}>
+        <span style={{fontSize:12,color:'#555'}}>日付</span>
+        <input type="date" value={date} onChange={e=>setDate(e.target.value)} style={{padding:8}} />
+        <button onClick={addRow} style={{marginLeft:8, padding:'6px 10px', border:'1px solid #111', background:'#fff', borderRadius:6}}>行を追加</button>
+        <button onClick={save} style={{background:BRAND_RED, color:'#fff', padding:'6px 10px', border:'none', borderRadius:6}}>保存</button>
+      </div>
+      <div style={{overflowX:'auto'}}>
+        <table style={{borderCollapse:'collapse', width:'100%'}}>
+          <thead>
+            <tr style={{background:'#f9fafb'}}>
+              <th style={{border:'1px solid #ddd', padding:6}}>削除</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>時刻(HH:MM:SS)</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>契約番号</th>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>上代合計</th>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>下代合計</th>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>粗利（自動）</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>流入</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>年齢</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>性別</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>担当者</th>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>明細数</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r,i)=>{
+              const profit = Number(r.saleTotal||0) - Number(r.payoutTotal||0);
+              return (
+                <tr key={i} style={{opacity:r._delete?0.5:1}}>
+                  <td style={{border:'1px solid #ddd', padding:6, textAlign:'center'}}>
+                    <input type="checkbox" checked={!!r._delete} onChange={()=>toggleDel(i)} />
+                  </td>
+                  <td style={{border:'1px solid #ddd', padding:6}}>
+                    <input value={r.time||''} onChange={e=>setField(i,'time',e.target.value)} style={{padding:6, width:130}} />
+                  </td>
+                  <td style={{border:'1px solid #ddd', padding:6}}>
+                    <input value={r.contractNo||''} onChange={e=>setField(i,'contractNo',e.target.value)} style={{padding:6}} />
+                  </td>
+                  <td style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>
+                    <input type="number" value={r.saleTotal||0} onChange={e=>setField(i,'saleTotal', Number(e.target.value))} style={{padding:6, width:140, textAlign:'right'}} />
+                  </td>
+                  <td style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>
+                    <input type="number" value={r.payoutTotal||0} onChange={e=>setField(i,'payoutTotal', Number(e.target.value))} style={{padding:6, width:140, textAlign:'right'}} />
+                  </td>
+                  <td style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>¥{profit.toLocaleString()}</td>
+                  <td style={{border:'1px solid #ddd', padding:6}}>
+                    <input value={r.leadShort||''} onChange={e=>setField(i,'leadShort', e.target.value)} style={{padding:6}} />
+                  </td>
+                  <td style={{border:'1px solid #ddd', padding:6}}>
+                    <input value={r.age||''} onChange={e=>setField(i,'age', e.target.value)} style={{padding:6, width:80}} />
+                  </td>
+                  <td style={{border:'1px solid #ddd', padding:6}}>
+                    <input value={r.gender||''} onChange={e=>setField(i,'gender', e.target.value)} style={{padding:6, width:100}} />
+                  </td>
+                  <td style={{border:'1px solid #ddd', padding:6}}>
+                    <input value={r.staff||''} onChange={e=>setField(i,'staff', e.target.value)} style={{padding:6}} />
+                  </td>
+                  <td style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>
+                    <input type="number" value={r.lines||0} onChange={e=>setField(i,'lines', Number(e.target.value))} style={{padding:6, width:90, textAlign:'right'}} />
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+/* ========= Snapshots (save/load current sheet & contract) ========= */
+function SnapshotsSection(){
+  const KEY='snapshotsV1';
+  const loadSnaps = ()=>{ try{ const a=JSON.parse(localStorage.getItem(KEY)||'[]'); return Array.isArray(a)? a:[]; }catch{ return []; } };
+  const saveSnaps = (a)=>{ try{ localStorage.setItem(KEY, JSON.stringify(a||[])); }catch{} };
+  const [list, setList] = React.useState(loadSnaps());
+  const [name, setName] = React.useState('');
+  const refresh = ()=> setList(loadSnaps());
+  const save = ()=>{
+    const snap = {
+      id: 'S'+Date.now(), name: (name||'無題'), created: new Date().toISOString(),
+      company: loadJSON(LS.company, DEFAULT_COMPANY),
+      customer: loadJSON(LS.customer, DEFAULT_CUSTOMER),
+      payment: loadJSON(LS.payment, {method:'現金'}),
+      storeCode: loadJSON(LS.storeCode, {code:'KI'}),
+      lead: loadJSON(LS.lead, { channel:'', sub:'', detail:'', couponLetter:'', couponNumber:'' }),
+      items: loadArray(LS.items),
+    };
+    const a = loadSnaps(); a.push(snap); saveSnaps(a); setName(''); refresh(); showToast('スナップショットを保存しました');
+  };
+  const restore = (s)=>{
+    try{
+      saveJSON(LS.company, s.company||{});
+      saveJSON(LS.customer, s.customer||{});
+      saveJSON(LS.payment, s.payment||{});
+      saveJSON(LS.storeCode, s.storeCode||{});
+      saveJSON(LS.lead, s.lead||{});
+      saveArray(LS.items, Array.isArray(s.items)? s.items: []);
+      window.dispatchEvent(new Event('RELOAD_ITEMS'));
+      showToast('読み込みました。査定計算表とプレビューでご確認ください。');
+    }catch{ showToast('読み込みに失敗しました','error'); }
+  };
+  const remove = (id)=>{ const a=loadSnaps().filter(s=>s.id!==id); saveSnaps(a); refresh(); };
+  const preview = (s, internal=false)=>{
+    const totals = (function(){ const subtotal=(s.items||[]).reduce((t,it)=> t + (Number(it.payoutManual||0) && it.payoutMode==='manual' ? floor100(Number(it.payoutManual||0)) : floor100(Number(it.unit||0)*Number(it.qty||0)*Number(it.rate||0)/10)), 0); const tax=Math.floor(subtotal*0.10); return { subtotal, tax, total:subtotal+tax }; })();
+    const rows = (s.items||[]).filter(r=>r && r.selected).map(r=>({ category:r.category, name:r.name||[r.item,r.detail].filter(Boolean).join(' '), qty:Number(r.qty||0), sale:Number(r.unit||0)*Number(r.qty||0), payout:(r.payoutMode==='manual'? floor100(Number(r.payoutManual||0)) : floor100(Number(r.unit||0)*Number(r.qty||0)*Number(r.rate||0)/10) ) }));
+    openPreview({ company: s.company||DEFAULT_COMPANY, customer: s.customer||DEFAULT_CUSTOMER, items: rows, totals, payment: s.payment||{method:'現金'}, storeCode: (s.storeCode&&s.storeCode.code)||'KI', internal, lead: s.lead||{} });
+  };
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{fontWeight:700, color:BRAND_RED}}>案件スナップショット（保存／読み込み）</div>
+      <div style={{display:'flex', gap:8, alignItems:'center', flexWrap:'wrap'}}>
+        <input value={name} onChange={e=>setName(e.target.value)} placeholder="スナップショット名（例：2025-08-10 午後の案件）" style={{padding:8, minWidth:260}} />
+        <button onClick={save} style={{background:BRAND_RED, color:'#fff', padding:'8px 12px', border:'none', borderRadius:8}}>保存</button>
+        <span style={{fontSize:12,color:'#666'}}>※ 署名画像は容量節約のため含めません（プレビュー時は現行の署名を使用）。</span>
+      </div>
+      <div style={{display:'grid', gap:6}}>
+        {list.length===0 && <div style={{fontSize:12,color:'#666'}}>保存済みのスナップショットはありません。</div>}
+        {list.map(s=> (
+          <div key={s.id} style={{display:'flex', gap:8, alignItems:'center', border:'1px solid #eee', borderRadius:8, padding:8, flexWrap:'wrap'}}>
+            <div style={{minWidth:220}}><b>{s.name}</b><div style={{fontSize:12,color:'#666'}}>{new Date(s.created).toLocaleString('ja-JP')}</div></div>
+            <div style={{display:'flex', gap:8}}>
+              <button onClick={()=>preview(s,false)} style={{padding:'6px 10px', border:'1px solid #111', background:'#fff', borderRadius:6}}>お客様控プレビュー</button>
+              <button onClick={()=>preview(s,true)} style={{padding:'6px 10px', border:'1px solid #111', background:'#fff', borderRadius:6}}>社内控プレビュー</button>
+              <button onClick={()=>restore(s)} style={{background:'#16a34a', color:'#fff', padding:'6px 10px', border:'none', borderRadius:6}}>読み込み（復元）</button>
+              <button onClick={()=>remove(s.id)} style={{padding:'6px 10px', border:'1px solid #111', background:'#fff', borderRadius:6}}>削除</button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/** ========= Preview (Customer/Internal) ========= */
+function openPreview({ company, customer, items, totals, payment, storeCode, internal = false, lead }){
+  const contractNo = (function(){ try{ const code = storeCode || "KI"; const k = `${code}-seq`; const now = new Date(); const y = now.getFullYear(); const m = String(now.getMonth()+1).padStart(2,'0'); const d = String(now.getDate()).padStart(2,'0'); const today = `${y}${m}${d}`; const raw = JSON.parse(localStorage.getItem(k)||"{}"); const seq = raw.day === today ? (Number(raw.seq||0)+1) : 1; return `保存時に採番（予定: ${code}-${today}-${String(seq).padStart(3,'0')}）`; }catch{ return '保存時に採番'; } })();
+  const headerTitle = internal ? "買取契約書（社内控／社外秘）" : "買取契約書（お客様控）";
+  const leadStr = lead ? ((lead.channel||'') + (lead.sub ? '／'+lead.sub : '') + (lead.detail ? '／'+lead.detail : '')) : '';
+  const couponStr = lead && lead.couponLetter && lead.couponNumber ? `${lead.couponLetter}-${String(lead.couponNumber).padStart(2,'0')}` : '';
+  const custSig = getSig(LS.signCustomer) || "";
+
+  const rowsHtml = (items||[]).map((it, idx)=>{
+    const qty = Number(it.qty||0);
+    const payout = Number(it.payout||0);
+    const sale = Number(it.sale||0);
+    const profit = sale ? (sale - payout) : 0;
+    if(internal){
+      return '<tr>'
+        + '<td style="text-align:right">'+(idx+1)+'</td>'
+        + '<td>'+ (it.category||'') +'</td>'
+        + '<td>'+ (it.name||'') +'</td>'
+        + '<td style="text-align:right">'+ qty +'</td>'
+        + '<td style="text-align:right">¥'+ sale.toLocaleString() +'</td>'
+        + '<td style="text-align:right">¥'+ payout.toLocaleString() +'</td>'
+        + '<td style="text-align:right">¥'+ profit.toLocaleString() +'</td>'
+        + '</tr>';
+    }
+    return '<tr>'
+      + '<td style="text-align:right">'+(idx+1)+'</td>'
+      + '<td>'+ (it.category||'') +'</td>'
+      + '<td>'+ (it.name||'') +'</td>'
+      + '<td style="text-align:right">'+ qty +'</td>'
+      + '<td style="text-align:right">¥'+ payout.toLocaleString() +'</td>'
+      + '</tr>';
+  }).join('');
+
+  const thead = internal
+    ? '<tr><th>No.</th><th>カテゴリ</th><th>品目</th><th style="text-align:right">数量</th><th style="text-align:right">上代</th><th style="text-align:right">下代</th><th style="text-align:right">粗利</th></tr>'
+    : '<tr><th>No.</th><th>カテゴリ</th><th>品目</th><th style="text-align:right">数量</th><th style="text-align:right">支払（税抜）</th></tr>';
+
+  const totalsHtml = internal ? '' : (
+    `<div class="totals">小計（税抜） ¥${(totals?.subtotal||0).toLocaleString()} ／ 消費税(10%) ¥${(totals?.tax||0).toLocaleString()} ／ <b>税込合計 ¥${(totals?.total||0).toLocaleString()}</b></div>`
+  );
+
+  const subtotal = (totals && totals.subtotal) || 0; const tax = (totals && totals.tax) || 0; const grand = (totals && totals.total) || 0;
+const html = '<!doctype html><html><head><meta charset="utf-8"><title>' + headerTitle + '</title>' +
+  '<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Hiragino Kaku Gothic ProN",Meiryo,sans-serif;margin:0;padding:16px;color:#111;position:relative}' +
+  'h2{margin:0 0 8px;color:' + BRAND_RED + '}' +
+  'table{border-collapse:collapse;width:100%;margin-top:10px}' +
+  'th,td{border:1px solid #ddd;padding:6px;font-size:13px} th{background:#f9fafb;text-align:left}' +
+  '.totals{margin-top:10px;text-align:right}' +
+  '.wm{position:fixed;inset:0;display:' + (internal ? 'block' : 'none') + ';pointer-events:none}' +
+  '.wm span{position:absolute;top:35%;left:10%;font-size:120px;color:' + BRAND_RED + ';opacity:.08;transform:rotate(-24deg)}' +
+  '.warn{color:' + BRAND_RED + ';font-weight:700}' +
+  '@media print{button{display:none}}' +
+  '</style></head><body>' +
+  '<div class="wm"><span>社内控／社外秘</span></div>' +
+  '<h2>' + headerTitle + '</h2>' +
+  '<div>契約番号: ' + contractNo + '　契約日: ' + new Date().toLocaleDateString('ja-JP') + '</div>' +
+  '<div>' + (company.company||'') + '／' + (company.store||'') + '</div>' +
+  '<div>TEL ' + (company.tel1||'') + ' / ' + (company.tel2||'') + '　 許可 ' + (company.permit||'') + '</div>' +
+  '<div>' + (company.note||"") + '</div>' +
+  (internal ? '<div class="warn">※ この書類は社内控です。お客様へは渡さないでください。</div>' : '') +
+  '<h3 style="margin:12px 0 6px">お客様情報</h3>' +
+  '<div>氏名：' + (customer.name||'') + '　電話：' + (customer.phone||'') + '</div>' +
+  '<div>住所：' + (customer.address||'') + '</div>' +
+  '<div>本人確認：' + (customer.idType||'') + '（番号：' + (customer.idNumber||'') + '／有効期限：' + (customer.idExpiry||'') + '）</div>' +
+  (internal && leadStr ? '<div>流入：' + leadStr + '</div>' : '') +
+  (internal && couponStr ? '<div>クーポン：' + couponStr + '</div>' : '') +
+  '<h3 style="margin:12px 0 6px">明細</h3>' +
+  '<table><thead>' + thead + '</thead><tbody>' + rowsHtml + '</tbody></table>' +
+  (internal ? '' : ('<div class="totals">小計（税抜） ¥' + subtotal.toLocaleString() + ' ／ 消費税(10%) ¥' + tax.toLocaleString() + ' ／ <b>税込合計 ¥' + grand.toLocaleString() + '</b></div>')) +
+  '<h3 style="margin:14px 0 6px">署名</h3>' +
+  '<div style="display:flex;gap:24px;align-items:flex-start;margin-top:8px">' +
+  '<div><div style="font-size:12px;color:#555">お客様署名</div>' +
+  (custSig ? '<img src="' + custSig + '" style="width:260px;height:auto;border:1px solid #ddd;border-radius:6px" />' : '<div style="width:260px;height:120px;border:1px dashed #bbb;border-radius:6px"></div>') +
+  '</div></div>' +
+  '<button onclick="window.print()" style="margin-top:12px;padding:8px 12px;border:1px solid ' + BRAND_RED + ';background:#fff;color:' + BRAND_RED + ';border-radius:8px;cursor:pointer">印刷（PDF保存）</button>' +
+  '</body></html>';
+
+  const w = window.open('', '_blank'); if(!w){ showToast('ポップアップを許可してください','warn'); return; }
+  w.document.write(html);
+  w.document.close();
+}
+
+/** ========= App (full) ========= **/
+/** ========= Missed Items (買いこぼし) ========= **/
+function MissedBoard(){
+  const [list, setList] = React.useState(loadMissed());
+  const [filter, setFilter] = React.useState('open'); // 'open' | 'all'
+  const statuses = ['未対応','フォロー中','完了'];
+
+  React.useEffect(()=>{ saveMissed(list); }, [list]);
+
+  const add = ()=> setList(prev=> [...prev, {date:new Date().toISOString(), category:'', name:'', qty:1, unit:0, rate:10, offer:0, status:'未対応', reason:'', memo:'', next:'', staff:(loadJSON(LS.staff,{name:''}).name||'')}]);
+  const del = (i)=> setList(prev=> prev.filter((_,idx)=> idx!==i));
+  const setField = (i,k,v)=> setList(prev=> prev.map((r,idx)=> idx===i? {...r, [k]:v}: r));
+  const save = ()=> { saveMissed(list); showToast('保存しました'); };
+  const csv = ()=>{
+    const header = ['日時','カテゴリ','品名','数量','売却見込(¥/単位)','提示(支払)','掛け率','担当','状態','理由','次回提案','メモ'];
+    const esc = (s)=>{
+      const t = String(s==null ? '' : s);
+      const need = t.includes('"') || t.includes(',') || t.includes('\n') || t.includes('\r');
+      const t2 = t.replace(/"/g,'""');
+      return need ? ('"'+t2+'"') : t2;
+    };
+    const rows = list.map(r=> [r.date||'', r.category||'', r.name||'', r.qty||0, r.unit||0, r.offer||0, r.rate||'', r.staff||'', r.status||'', r.reason||'', r.next||'', r.memo||'']);
+    const out = [header.map(esc).join(','), ...rows.map(row=> row.map(esc).join(','))].join('\r\n');
+    const href = 'data:text/csv;charset=utf-8,%EF%BB%BF' + encodeURIComponent(out);
+    const a = document.createElement('a'); a.href = href; a.download = 'missed_items.csv'; document.body.appendChild(a); a.click(); a.remove();
+  };
+  const pushToItems = (i)=>{
+    const r = list[i];
+    const items = loadArray(LS.items);
+    items.push({
+      selected:false,
+      category: r.category||'その他',
+      item: r.name||'',
+      detail:'',
+      qty: Number(r.qty||1),
+      unit: Number(r.unit||0),
+      rate: Number(r.rate||10),
+      payoutMode:'manual',
+      payoutManual: floor100(Number(r.offer||0)),
+      name: r.name||'',
+      sync:false,
+      priceKey:''
+    });
+    saveArray(LS.items, items);
+    window.dispatchEvent(new Event('RELOAD_ITEMS'));
+    showToast('査定計算表へ追加しました');
+  };
+  const view = list.filter(r=> filter==='all' ? true : (r.status!=='完了'));
+  const isOverdue = (dt)=> { if(!dt) return false; const t=Date.parse(dt); if(!isFinite(t)) return false; return t < Date.now(); };
+  return (
+    <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+      <div style={{display:'flex', gap:8, alignItems:'center', justifyContent:'space-between', flexWrap:'wrap'}}>
+        <div style={{fontWeight:700, color:BRAND_RED}}>買いこぼし（フォロー管理）</div>
+        <div style={{display:'flex', gap:8}}>
+          <button onClick={add} style={{padding:'8px 12px', border:'1px solid #111', background:'#fff', borderRadius:8}}>新規</button>
+          <button onClick={save} style={{background:BRAND_RED, color:'#fff', padding:'8px 12px', border:'none', borderRadius:8}}>保存</button>
+          <button onClick={csv} style={{padding:'8px 12px', border:'1px solid #111', background:'#fff', borderRadius:8}}>CSV</button>
+        </div>
+      </div>
+      <div style={{display:'flex', gap:12, alignItems:'center'}}>
+        <label style={{display:'flex', gap:6, alignItems:'center'}}>
+          <input type="radio" name="missedF" value="open" checked={filter==='open'} onChange={()=>setFilter('open')} /> 未完了のみ
+        </label>
+        <label style={{display:'flex', gap:6, alignItems:'center'}}>
+          <input type="radio" name="missedF" value="all" checked={filter==='all'} onChange={()=>setFilter('all')} /> すべて
+        </label>
+      </div>
+      <div style={{overflowX:'auto'}}>
+        <table style={{borderCollapse:'collapse', width:'100%'}}>
+          <thead>
+            <tr style={{background:'#f9fafb'}}>
+              <th style={{border:'1px solid #ddd', padding:6}}>削除</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>日時</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>カテゴリ</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>品名</th>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>数量</th>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>売却見込</th>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>提示(支払)</th>
+              <th style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>掛け率</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>担当</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>状態</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>理由</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>次回提案</th>
+              <th style={{border:'1px solid #ddd', padding:6}}>メモ</th>
+              <th style={{border:'1px solid #ddd', padding:6}}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {view.map((r,i)=> (
+              <tr key={i} style={{background: isOverdue(r.next) && r.status!=='完了' ? '#fff5f5' : '#fff' }}>
+                <td style={{border:'1px solid #ddd', padding:6, textAlign:'center'}}>
+                  <button onClick={()=>del(i)} style={{padding:'4px 8px'}}>削除</button>
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6}}>
+                  <input type="datetime-local" value={(r.date||'').slice(0,16)} onChange={e=>setField(i,'date', e.target.value)} style={{padding:6}} />
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6}}>
+                  <input value={r.category||''} onChange={e=>setField(i,'category', e.target.value)} style={{padding:6}} placeholder="例：貴金属" />
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6}}>
+                  <input value={r.name||''} onChange={e=>setField(i,'name', e.target.value)} style={{padding:6}} placeholder="例：K18 ネックレス" />
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>
+                  <input type="number" value={r.qty||0} onChange={e=>setField(i,'qty', Number(e.target.value))} style={{padding:6, width:90, textAlign:'right'}} />
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>
+                  <input type="number" value={r.unit||0} onChange={e=>setField(i,'unit', Number(e.target.value))} style={{padding:6, width:120, textAlign:'right'}} />
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>
+                  <input type="number" value={r.offer||0} onChange={e=>setField(i,'offer', Number(e.target.value))} style={{padding:6, width:120, textAlign:'right'}} />
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6, textAlign:'right'}}>
+                  <select value={r.rate||10} onChange={e=>setField(i,'rate', Number(e.target.value))} style={{padding:6}}>
+                    {[1,2,3,4,5,6,7,8,9,10].map(n=> <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6}}>
+                  <input value={r.staff||''} onChange={e=>setField(i,'staff', e.target.value)} style={{padding:6}} />
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6}}>
+                  <select value={r.status||'未対応'} onChange={e=>setField(i,'status', e.target.value)} style={{padding:6}}>
+                    {statuses.map(s=> <option key={s} value={s}>{s}</option>)}
+                  </select>
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6}}>
+                  <input value={r.reason||''} onChange={e=>setField(i,'reason', e.target.value)} style={{padding:6}} placeholder="例：他店比較／相場待ち など" />
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6}}>
+                  <input type="datetime-local" value={(r.next||'').slice(0,16)} onChange={e=>setField(i,'next', e.target.value)} style={{padding:6}} />
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6}}>
+                  <input value={r.memo||''} onChange={e=>setField(i,'memo', e.target.value)} style={{padding:6}} />
+                </td>
+                <td style={{border:'1px solid #ddd', padding:6}}>
+                  <button onClick={()=>pushToItems(i)} style={{padding:'4px 8px'}}>→ 査定へ戻す</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+export default function App(){
+  const [tab, setTab] = useState('査定計算表');
+  const settings = loadSettings();
+  useEffect(()=>{ const st = loadSettings(); if(st.newSheetOnLaunch){ const key='clearedDayV1'; const today=new Date().toISOString().slice(0,10); const done=localStorage.getItem(key); if(done!==today){ window.dispatchEvent(new Event('CLEAR_ITEMS')); localStorage.setItem(key,today); } } },[]);
+  const handleNewStart = () => { if(confirm('明細をすべてクリアしますか？')){ window.dispatchEvent(new Event('CLEAR_ITEMS')); saveArray(LS.items, []); } };
+  const handleSaveContract = (andClear=false) => {
+    const company  = loadJSON(LS.company, DEFAULT_COMPANY);
+    const customer = loadJSON(LS.customer, DEFAULT_CUSTOMER);
+    const payment  = loadJSON(LS.payment, { method: '現金' });
+    const sc       = loadJSON(LS.storeCode, { code: 'KI' });
+    const lead     = loadJSON(LS.lead, { channel:'', sub:'', detail:'', couponLetter:'', couponNumber:'' });
+    const staff    = loadJSON(LS.staff, { name:'' });
+    const itemsOut = getRowsForPreview();
+    if(!itemsOut.length){ alert('✓ が付いた明細がありません'); return; }
+    const saleTotal   = itemsOut.reduce((s,it)=> s + (it.sale||0), 0);
+    const payoutTotal = itemsOut.reduce((s,it)=> s + (it.payout||0), 0);
+    const profitTotal = saleTotal - payoutTotal;
+    const lines = itemsOut.length;
+    const leadShort = (lead.channel||'') + (lead.sub? '／'+lead.sub : '') + ((lead.couponLetter&&lead.couponNumber)? ('／'+lead.couponLetter+'-'+String(lead.couponNumber).padStart(2,'0')) : '');
+    const contractNo = nextContractNo((sc.code||'KI'));
+    const nowIso = new Date().toISOString();
+    appendDealLog({ date: nowIso, time: nowIso, contractNo, saleTotal, payoutTotal, profitTotal, lines, leadShort, age: customer.age||'', gender: customer.gender||'', staff: (staff.name||''), items: itemsOut, payment: (payment.method||''), customerName: (customer.name||'') });
+    const keep = Number(settings.retentionDays||60); pruneLogs(keep);
+    showToast('保存しました（契約番号: ' + contractNo + '）');
+    if(andClear){ window.dispatchEvent(new Event('CLEAR_ITEMS')); saveArray(LS.items, []); }
+  };
+
+
+  const getRowsForPreview = () => {
+    const rows = loadArray(LS.items).filter(r=>r && r.selected);
+    return rows.map(r=>{
+      const sale = Number(r.unit||0) * Number(r.qty||0);
+      const payout = (r.payoutMode==='manual' ? floor100(Number(r.payoutManual||0)) : floor100(sale * Number(r.rate||0) / 10));
+      const dispName = r.name || [r.item, r.detail].filter(Boolean).join(' ');
+      return { category:r.category, name:dispName, qty: Number(r.qty||0), sale, payout };
+    });
+  };
+  const calcTotals = (itemsOut) => {
+    const subtotal = itemsOut.reduce((s,it)=> s + (it.payout||0), 0);
+    const tax = Math.floor(subtotal * 0.10);
+    const total = subtotal + tax;
+    return { subtotal, tax, total };
+  };
+  const handlePreviewCustomer = () => {
+    const company  = loadJSON(LS.company, DEFAULT_COMPANY);
+    const customer = loadJSON(LS.customer, DEFAULT_CUSTOMER);
+    const payment  = loadJSON(LS.payment, { method: '現金' });
+    const sc       = loadJSON(LS.storeCode, { code: 'KI' });
+    const itemsOut = getRowsForPreview();
+    const totals   = calcTotals(itemsOut);
+    const lead     = loadJSON(LS.lead, { channel:"", sub:"", detail:"", couponLetter:"", couponNumber:"" });
+    openPreview({ company, customer, items: itemsOut, totals, payment, storeCode: (sc.code||'KI'), internal:false, lead });
+  };
+  const handlePreviewInternal = () => {
+    const company  = loadJSON(LS.company, DEFAULT_COMPANY);
+    const customer = loadJSON(LS.customer, DEFAULT_CUSTOMER);
+    const payment  = loadJSON(LS.payment, { method: '現金' });
+    const sc       = loadJSON(LS.storeCode, { code: 'KI' });
+    const itemsOut = getRowsForPreview();
+    const totals   = calcTotals(itemsOut);
+    const lead     = loadJSON(LS.lead, { channel:"", sub:"", detail:"", couponLetter:"", couponNumber:"" });
+    openPreview({ company, customer, items: itemsOut, totals, payment, storeCode: (sc.code||'KI'), internal:true, lead });
+  };
+  const handleOpenSummary = () => { openDailySummaryTab(); };
+
+  // Global keyboard shortcuts (Speed mode)
+  useEffect(()=>{
+    const onKey = (e)=>{
+      const active = document.activeElement;
+      const tag = (active && active.tagName ? active.tagName.toLowerCase() : '');
+      const typing = (active && (active.isContentEditable || ['input','textarea','select'].includes(tag)));
+      if(typing && !(e.ctrlKey||e.metaKey)) return;
+      const k = (e.key||'').toLowerCase();
+      if((e.ctrlKey||e.metaKey) && k==='s'){ e.preventDefault(); handleSaveContract(false); }
+      if(e.shiftKey && k==='p'){ e.preventDefault(); handlePreviewCustomer(); }
+      if(e.shiftKey && k==='i'){ e.preventDefault(); handlePreviewInternal(); }
+      if(e.altKey && k==='n'){ e.preventDefault(); window.dispatchEvent(new Event('ADD_ITEM_ROW')); showToast('行を追加'); }
+      if(e.altKey && k==='r'){ e.preventDefault(); window.dispatchEvent(new Event('REAPPLY_PRICES')); showToast('相場から再適用'); }
+    };
+    window.addEventListener('keydown', onKey);
+    return ()=> window.removeEventListener('keydown', onKey);
+  }, [handleSaveContract, handlePreviewCustomer, handlePreviewInternal]);
+
+  return (
+    <div style={{padding:12, display:'grid', gap:12}}>
+      <GlobalStyles />
+      <ToastHost />
+      {/* タブナビ */}
+      <div style={{display:'flex', gap:8, borderBottom:'1px solid #eee', paddingBottom:6}}>
+        {['査定計算表','契約情報','設定','買いこぼし','集計/出力'].map(t => (
+          <button key={t} onClick={()=>setTab(t)}
+            style={{ padding:'8px 12px', border:'none',
+                     borderBottom: tab===t ? ('3px solid ' + BRAND_RED) : '3px solid transparent',
+                     background:'#fff', color: tab===t? BRAND_RED : '#111',
+                     fontWeight: tab===t? 700:500, cursor:'pointer' }}>
+            {t}
+          </button>
+        ))}
+      </div>
+
+      {tab==='査定計算表' && (
+        <>
+          <ItemsEditor />
+          <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'flex', gap:8, flexWrap:'wrap'}}>
+            <button onClick={handlePreviewCustomer} style={{background:BRAND_RED,color:'#fff',padding:'10px 14px',border:'none',borderRadius:8}}>お客様控プレビュー（印刷/PDF）</button>
+            <button onClick={handlePreviewInternal} style={{background:'#111',color:'#fff',padding:'10px 14px',border:'none',borderRadius:8}}>社内控プレビュー（粗利含む）</button>
+            <button onClick={handleOpenSummary} style={{background:'#fff',color:'#111',padding:'10px 14px',border:'1px solid #111',borderRadius:8}}>日次集計を開く</button>
+            <button onClick={()=>handleSaveContract(false)} style={{background:'#2563eb',color:'#fff',padding:'10px 14px',border:'none',borderRadius:8}}>契約を保存（ログ）</button>
+            <button onClick={()=>handleSaveContract(true)} style={{background:'#16a34a',color:'#fff',padding:'10px 14px',border:'none',borderRadius:8}}>保存＋新規開始</button>
+            <button onClick={handleNewStart} style={{background:'#fff',color:'#111',padding:'10px 14px',border:'1px solid #111',borderRadius:8}}>新規開始（明細を空に）</button>
+            <span style={{marginLeft:'auto', fontSize:12, color:'#666'}}>保存期間: {settings.retentionDays||60}日</span>
+          </section>
+        </>
+      )}
+
+      {tab==='契約情報' && (
+        <>
+          <CustomerInfo />
+          <PaymentMethod />
+          <StaffSelector />
+          <LeadAndCoupon />
+          <SignaturesSection />
+          <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'flex', gap:8, flexWrap:'wrap'}}>
+            <button onClick={handlePreviewCustomer} style={{background:BRAND_RED,color:'#fff',padding:'10px 14px',border:'none',borderRadius:8}}>お客様控プレビュー（印刷/PDF）</button>
+            <button onClick={handlePreviewInternal} style={{background:'#111',color:'#fff',padding:'10px 14px',border:'none',borderRadius:8}}>社内控プレビュー（粗利含む）</button>
+            <button onClick={handleOpenSummary} style={{background:'#fff',color:'#111',padding:'10px 14px',border:'1px solid #111',borderRadius:8}}>日次集計を開く</button>
+          </section>
+        </>
+      )}
+
+      {tab==='設定' && (
+        <>
+          <CompanyInfo />
+          <StoreCodeSetting />
+          <BasicSettingsSection />
+          <CategoryItemMasterSection />
+          <BrandMasterSection />
+          <PricesManualSection />
+        </>
+      )}
+
+      {tab==='買いこぼし' && (
+        <MissedBoard />
+      )}
+
+      {tab==='集計/出力' && (
+        <>
+          <SummaryEditor />
+          <SnapshotsSection />
+          <section style={{border:'1px solid #eee', borderRadius:10, padding:12, display:'grid', gap:8}}>
+            <div style={{fontWeight:700, color:BRAND_RED}}>出力・集計メニュー</div>
+            <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
+              <button onClick={handleOpenSummary} style={{background:'#fff',color:'#111',padding:'10px 14px',border:'1px solid #111',borderRadius:8}}>日次集計を開く</button>
+              <button onClick={handlePreviewCustomer} style={{background:BRAND_RED,color:'#fff',padding:'10px 14px',border:'none',borderRadius:8}}>お客様控プレビュー（印刷/PDF）</button>
+              <button onClick={handlePreviewInternal} style={{background:'#111',color:'#fff',padding:'10px 14px',border:'none',borderRadius:8}}>社内控プレビュー（粗利含む）</button>
+            </div>
+            <div style={{fontSize:12,color:'#666'}}>※ プレビューは新しいタブで開きます。社内控は「社外秘」透かし付き。</div>
+          </section>
+        </>
+      )}
+    </div>
+  );
+}
